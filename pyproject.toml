@@ -1,0 +1,17 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "nimble-reviewer"
+version = "0.1.0"
+description = "GitLab merge request auto-review bot powered by Codex CLI or Claude Code."
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+  "fastapi>=0.115,<1.0",
+  "uvicorn[standard]>=0.32,<1.0",
+]
+
+[tool.setuptools.packages.find]
+include = ["nimble_reviewer*"]

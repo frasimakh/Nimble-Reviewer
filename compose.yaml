@@ -1,0 +1,27 @@
+services:
+  nimble-reviewer:
+    build:
+      context: .
+    restart: unless-stopped
+    env_file:
+      - path: .env
+        required: false
+    ports:
+      - "${HOST_PORT:-8080}:${PORT:-8080}"
+    volumes:
+      - reviewer-data:/data
+      - reviewer-cache:/cache
+      - reviewer-auth:/home/reviewer/.codex
+      - reviewer-claude-auth:/home/reviewer/.claude
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:${PORT:-8080}/healthz"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+
+volumes:
+  reviewer-data:
+  reviewer-cache:
+  reviewer-auth:
+  reviewer-claude-auth:
