@@ -4,9 +4,8 @@ import os
 import shlex
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Literal
 
-ReviewAgentProvider = Literal["codex", "claude"]
+from nimble_reviewer.models import ReviewProvider
 
 
 @dataclass(frozen=True)
@@ -14,9 +13,10 @@ class Settings:
     gitlab_url: str
     gitlab_token: str
     gitlab_webhook_secret: str
-    review_agent_provider: ReviewAgentProvider
-    codex_cmd: tuple[str, ...] | None
-    claude_cmd: tuple[str, ...] | None
+    codex_cmd: tuple[str, ...]
+    claude_cmd: tuple[str, ...]
+    council_synthesis_provider: ReviewProvider
+    council_synthesis_cmd: tuple[str, ...]
     sqlite_path: Path
     repo_cache_dir: Path
     review_trace_dir: Path
@@ -28,14 +28,20 @@ class Settings:
 
     @classmethod
     def from_env(cls) -> "Settings":
-        provider = _read_review_agent_provider()
         return cls(
             gitlab_url=_read_required("GITLAB_URL").rstrip("/"),
             gitlab_token=_read_required("GITLAB_TOKEN"),
             gitlab_webhook_secret=_read_required("GITLAB_WEBHOOK_SECRET"),
-            review_agent_provider=provider,
-            codex_cmd=_read_command_if_selected("CODEX_CMD", provider, "codex"),
-            claude_cmd=_read_command_if_selected("CLAUDE_CMD", provider, "claude"),
+            codex_cmd=_read_command(
+                "CODEX_CMD",
+                default='codex exec -m gpt-5.4 -c model_reasoning_effort="high" -',
+            ),
+            claude_cmd=_read_command(
+                "CLAUDE_CMD",
+                default="claude -p --output-format stream-json --model sonnet --effort high --permission-mode bypassPermissions",
+            ),
+            council_synthesis_provider=_read_review_provider("COUNCIL_SYNTHESIS_PROVIDER", default="codex"),
+            council_synthesis_cmd=_read_synthesis_command(),
             sqlite_path=Path(_read_required("SQLITE_PATH")),
             repo_cache_dir=Path(_read_required("REPO_CACHE_DIR")),
             review_trace_dir=Path(os.getenv("REVIEW_TRACE_DIR", "/data/review-traces")),
@@ -54,23 +60,24 @@ def _read_required(name: str) -> str:
     return value
 
 
-def _read_review_agent_provider() -> ReviewAgentProvider:
-    raw = os.getenv("REVIEW_AGENT_PROVIDER", "codex").strip().lower()
+def _read_review_provider(name: str, default: ReviewProvider) -> ReviewProvider:
+    raw = os.getenv(name, default).strip().lower()
     if raw not in {"codex", "claude"}:
-        raise RuntimeError(
-            "Invalid REVIEW_AGENT_PROVIDER. Expected one of: codex, claude"
-        )
+        raise RuntimeError(f"Invalid {name}. Expected one of: codex, claude")
     return raw  # type: ignore[return-value]
 
 
-def _read_command_if_selected(
-    env_name: str,
-    selected_provider: ReviewAgentProvider,
-    expected_provider: ReviewAgentProvider,
-) -> tuple[str, ...] | None:
-    value = os.getenv(env_name)
-    if selected_provider != expected_provider:
-        return tuple(shlex.split(value)) if value else None
+def _read_command(env_name: str, default: str | None = None) -> tuple[str, ...]:
+    value = os.getenv(env_name, default or "").strip()
     if not value:
         raise RuntimeError(f"Missing required environment variable: {env_name}")
     return tuple(shlex.split(value))
+
+
+def _read_synthesis_command() -> tuple[str, ...]:
+    provider = _read_review_provider("COUNCIL_SYNTHESIS_PROVIDER", default="codex")
+    if provider == "codex":
+        default = 'codex exec -m gpt-5.4 -c model_reasoning_effort="low" -'
+    else:
+        default = "claude -p --output-format stream-json --model sonnet --effort low --permission-mode bypassPermissions"
+    return _read_command("COUNCIL_SYNTHESIS_CMD", default=default)

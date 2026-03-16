@@ -1,20 +1,32 @@
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import json
+import logging
 import subprocess
 import tempfile
+import time
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Protocol
 
+from nimble_reviewer.finding_match import findings_match
 from nimble_reviewer.models import (
     ReviewAgentMetadata,
     ReviewFinding,
+    ReviewOpinion,
+    ReviewParticipant,
+    ReviewProvider,
     ReviewResult,
     ReviewTokenUsage,
 )
+from nimble_reviewer.prompts import build_council_synthesis_prompt
 from nimble_reviewer.trace import RunTrace
 
 VALID_SEVERITIES = {"high", "medium", "low"}
+VALID_PROVIDERS = {"codex", "claude"}
+VALID_OPINION_VERDICTS = {"found", "agree", "disagree", "uncertain"}
+LOGGER = logging.getLogger(__name__)
 
 
 class ReviewAgentError(RuntimeError):
@@ -28,6 +40,18 @@ class ReviewAgentRunner(Protocol):
         ...
 
 
+class JsonCapableReviewAgent(ReviewAgentRunner, Protocol):
+    agent_metadata: ReviewAgentMetadata
+
+    def run_json(
+        self,
+        prompt: str,
+        cwd: Path,
+        trace: RunTrace | None = None,
+    ) -> tuple[dict, ReviewTokenUsage | None]:
+        ...
+
+
 class CodexRunner:
     provider_name = "codex"
 
@@ -37,26 +61,20 @@ class CodexRunner:
         self.agent_metadata = _extract_agent_metadata(self.provider_name, command)
 
     def review(self, prompt: str, cwd: Path, trace: RunTrace | None = None) -> ReviewResult:
+        payload, usage = self.run_json(prompt, cwd, trace=trace)
+        return _review_result_from_payload(payload, self.agent_metadata, usage)
+
+    def run_json(
+        self,
+        prompt: str,
+        cwd: Path,
+        trace: RunTrace | None = None,
+    ) -> tuple[dict, ReviewTokenUsage | None]:
         errors: list[str] = []
         for attempt in range(2):
             raw, usage = self._run_once(prompt, cwd, trace)
             try:
-                result = _parse_review_result(raw)
-                if usage:
-                    return ReviewResult(
-                        summary=result.summary,
-                        overall_risk=result.overall_risk,
-                        findings=result.findings,
-                        token_usage=usage,
-                        agent_metadata=self.agent_metadata,
-                    )
-                return ReviewResult(
-                    summary=result.summary,
-                    overall_risk=result.overall_risk,
-                    findings=result.findings,
-                    token_usage=result.token_usage,
-                    agent_metadata=self.agent_metadata,
-                )
+                return _load_json_object(raw), usage
             except ReviewAgentError as exc:
                 errors.append(f"attempt {attempt + 1}: {exc}")
         raise ReviewAgentError("; ".join(errors))
@@ -95,18 +113,20 @@ class ClaudeRunner:
         self.agent_metadata = _extract_agent_metadata(self.provider_name, command)
 
     def review(self, prompt: str, cwd: Path, trace: RunTrace | None = None) -> ReviewResult:
+        payload, usage = self.run_json(prompt, cwd, trace=trace)
+        return _review_result_from_payload(payload, self.agent_metadata, usage)
+
+    def run_json(
+        self,
+        prompt: str,
+        cwd: Path,
+        trace: RunTrace | None = None,
+    ) -> tuple[dict, ReviewTokenUsage | None]:
         errors: list[str] = []
         for attempt in range(2):
             try:
                 raw, usage = self._run_once(prompt, cwd, trace)
-                result = _parse_review_result(raw)
-                return ReviewResult(
-                    summary=result.summary,
-                    overall_risk=result.overall_risk,
-                    findings=result.findings,
-                    token_usage=usage or result.token_usage,
-                    agent_metadata=self.agent_metadata,
-                )
+                return _load_json_object(raw), usage
             except ReviewAgentError as exc:
                 errors.append(f"attempt {attempt + 1}: {exc}")
         raise ReviewAgentError("; ".join(errors))
@@ -131,6 +151,514 @@ class ClaudeRunner:
         if output_format == "stream-json":
             return _extract_claude_result_from_stream(raw), usage
         return _extract_claude_result(raw), usage
+
+
+class CouncilRunner:
+    provider_name = "council"
+
+    def __init__(
+        self,
+        codex_runner: JsonCapableReviewAgent,
+        claude_runner: JsonCapableReviewAgent,
+        synthesizer: JsonCapableReviewAgent,
+    ) -> None:
+        self.codex_runner = codex_runner
+        self.claude_runner = claude_runner
+        self.synthesizer = synthesizer
+
+    def review(self, prompt: str, cwd: Path, trace: RunTrace | None = None) -> ReviewResult:
+        provider_runs: list[_ProviderRun] = []
+        codex_result, claude_result = self._run_parallel_reviews(prompt, cwd, trace, provider_runs)
+
+        synthesis_prompt = build_council_synthesis_prompt(
+            prompt,
+            codex_result=codex_result,
+            claude_result=claude_result,
+        )
+        if trace:
+            trace.write(
+                "council",
+                "synthesis.started",
+                provider=self.synthesizer.provider_name,
+            )
+        LOGGER.info(
+            "Council synthesis started provider=%s model=%s reasoning=%s",
+            self.synthesizer.provider_name,
+            self.synthesizer.agent_metadata.model or "default",
+            self.synthesizer.agent_metadata.reasoning_effort or "default",
+        )
+        synthesis_started = time.monotonic()
+        synthesis_payload, synthesis_usage = self.synthesizer.run_json(synthesis_prompt, cwd, trace=trace)
+        if trace:
+            trace.write_snapshot(f"{self.synthesizer.provider_name}.synthesis", synthesis_payload)
+        provider_runs.append(
+            _ProviderRun(
+                provider=self.synthesizer.provider_name,  # type: ignore[arg-type]
+                phase="synthesis",
+                metadata=self.synthesizer.agent_metadata,
+                token_usage=synthesis_usage,
+            )
+        )
+        final_result = _review_result_from_payload(
+            synthesis_payload,
+            metadata=None,
+            token_usage=None,
+            require_sources=True,
+        )
+        final_result, preserved_count, attribution_updates = _reconcile_council_findings(
+            final_result,
+            codex_result=codex_result,
+            claude_result=claude_result,
+        )
+        participants = _summarize_participants(provider_runs)
+        if trace:
+            trace.write(
+                "council",
+                "synthesis.completed",
+                provider=self.synthesizer.provider_name,
+                findings=len(final_result.findings),
+                overall_risk=final_result.overall_risk,
+                preserved_findings=preserved_count,
+                attribution_updates=attribution_updates,
+                participants=[
+                    {
+                        "provider": participant.metadata.provider,
+                        "model": participant.metadata.model,
+                        "reasoning_effort": participant.metadata.reasoning_effort,
+                        "phases": list(participant.phases),
+                        "token_usage": _token_usage_to_payload(participant.token_usage),
+                    }
+                    for participant in participants
+                ],
+            )
+        LOGGER.info(
+            "Council synthesis finished provider=%s findings=%s overall_risk=%s preserved_findings=%s attribution_updates=%s phase_sec=%.2f",
+            self.synthesizer.provider_name,
+            len(final_result.findings),
+            final_result.overall_risk,
+            preserved_count,
+            attribution_updates,
+            time.monotonic() - synthesis_started,
+        )
+        return ReviewResult(
+            summary=final_result.summary,
+            overall_risk=final_result.overall_risk,
+            findings=final_result.findings,
+            participants=participants,
+        )
+
+    def _run_review_phase(
+        self,
+        runner: JsonCapableReviewAgent,
+        prompt: str,
+        cwd: Path,
+        trace: RunTrace | None,
+    ) -> ReviewResult:
+        if trace:
+            trace.write("council", "review.started", provider=runner.provider_name)
+        LOGGER.info(
+            "Council %s review started model=%s reasoning=%s",
+            runner.provider_name,
+            runner.agent_metadata.model or "default",
+            runner.agent_metadata.reasoning_effort or "default",
+        )
+        started = time.monotonic()
+        result = runner.review(prompt, cwd, trace=trace)
+        if trace:
+            trace.write_snapshot(f"{runner.provider_name}.review", _review_result_to_payload(result))
+        if trace:
+            trace.write(
+                "council",
+                "review.completed",
+                provider=runner.provider_name,
+                findings=len(result.findings),
+                overall_risk=result.overall_risk,
+            )
+        LOGGER.info(
+            "Council %s review finished findings=%s overall_risk=%s phase_sec=%.2f",
+            runner.provider_name,
+            len(result.findings),
+            result.overall_risk,
+            time.monotonic() - started,
+        )
+        return result
+
+    def _run_parallel_reviews(
+        self,
+        prompt: str,
+        cwd: Path,
+        trace: RunTrace | None,
+        provider_runs: list["_ProviderRun"],
+    ) -> tuple[ReviewResult, ReviewResult]:
+        results: dict[str, tuple[ReviewResult, _ProviderRun]] = {}
+        with ThreadPoolExecutor(max_workers=2, thread_name_prefix="council-review") as executor:
+            future_to_provider = {
+                executor.submit(self._run_review_phase, self.codex_runner, prompt, cwd, trace): "codex",
+                executor.submit(self._run_review_phase, self.claude_runner, prompt, cwd, trace): "claude",
+            }
+            for future in as_completed(future_to_provider):
+                provider = future_to_provider[future]
+                result = future.result()
+                provider_runs.append(
+                    _ProviderRun(
+                        provider=provider,  # type: ignore[arg-type]
+                        phase="review",
+                        metadata=result.agent_metadata or ReviewAgentMetadata(provider=provider),  # type: ignore[arg-type]
+                        token_usage=result.token_usage,
+                    )
+                )
+                results[provider] = (result, provider_runs[-1])
+        return results["codex"][0], results["claude"][0]
+
+
+@dataclass(frozen=True)
+class _ProviderRun:
+    provider: ReviewProvider
+    phase: str
+    metadata: ReviewAgentMetadata
+    token_usage: ReviewTokenUsage | None
+
+
+def _review_result_from_payload(
+    payload: dict,
+    metadata: ReviewAgentMetadata | None,
+    token_usage: ReviewTokenUsage | None,
+    require_sources: bool = False,
+) -> ReviewResult:
+    result = _parse_review_result_payload(payload, require_sources=require_sources)
+    return ReviewResult(
+        summary=result.summary,
+        overall_risk=result.overall_risk,
+        findings=result.findings,
+        token_usage=token_usage or result.token_usage,
+        agent_metadata=metadata,
+    )
+
+
+def _review_result_to_payload(result: ReviewResult) -> dict:
+    return {
+        "summary": result.summary,
+        "overall_risk": result.overall_risk,
+        "findings": [
+            {
+                "severity": finding.severity,
+                "file": finding.file,
+                "line": finding.line,
+                "title": finding.title,
+                "body": finding.body,
+                **({"suggestion": finding.suggestion} if finding.suggestion else {}),
+                **({"sources": list(finding.sources)} if finding.sources else {}),
+                **(
+                    {
+                        "opinions": [
+                            {
+                                "provider": opinion.provider,
+                                "verdict": opinion.verdict,
+                                **({"reason": opinion.reason} if opinion.reason else {}),
+                            }
+                            for opinion in finding.opinions
+                        ]
+                    }
+                    if finding.opinions
+                    else {}
+                ),
+            }
+            for finding in result.findings
+        ],
+        **({"token_usage": _token_usage_to_payload(result.token_usage)} if result.token_usage else {}),
+        **(
+            {
+                "agent_metadata": {
+                    "provider": result.agent_metadata.provider,
+                    "model": result.agent_metadata.model,
+                    "reasoning_effort": result.agent_metadata.reasoning_effort,
+                }
+            }
+            if result.agent_metadata
+            else {}
+        ),
+    }
+
+
+def _parse_review_result(raw: str) -> ReviewResult:
+    payload = _load_json_object(raw)
+    return _parse_review_result_payload(payload)
+
+
+def _parse_review_result_payload(payload: dict, require_sources: bool = False) -> ReviewResult:
+    summary = str(payload.get("summary", "")).strip()
+    overall_risk = str(payload.get("overall_risk", "")).strip().lower()
+    if not summary:
+        raise ReviewAgentError("Missing summary field")
+    if overall_risk not in VALID_SEVERITIES:
+        raise ReviewAgentError(f"Invalid overall_risk value: {overall_risk!r}")
+
+    findings_payload = payload.get("findings", [])
+    if not isinstance(findings_payload, list):
+        raise ReviewAgentError("findings must be an array")
+
+    findings: list[ReviewFinding] = []
+    for item in findings_payload:
+        severity = str(item.get("severity", "")).strip().lower()
+        file_path = str(item.get("file", "")).strip()
+        title = str(item.get("title", "")).strip()
+        body = str(item.get("body", "")).strip()
+        suggestion = str(item.get("suggestion", "")).strip()
+        line = item.get("line")
+        sources = _parse_finding_sources(item.get("sources"), require_sources=require_sources)
+        opinions = _parse_finding_opinions(item.get("opinions"))
+        if severity not in VALID_SEVERITIES:
+            raise ReviewAgentError(f"Invalid finding severity: {severity!r}")
+        if not file_path or not title or not body:
+            raise ReviewAgentError("Each finding requires file, title, and body")
+        if not isinstance(line, int) or line < 1:
+            raise ReviewAgentError("Each finding line must be a positive integer")
+        findings.append(
+            ReviewFinding(
+                severity=severity,
+                file=file_path,
+                line=line,
+                title=title,
+                body=body,
+                suggestion=suggestion or None,
+                sources=sources,
+                opinions=opinions,
+            )
+        )
+
+    return ReviewResult(
+        summary=summary,
+        overall_risk=overall_risk,
+        findings=tuple(findings),
+    )
+
+
+def _parse_finding_sources(value, require_sources: bool) -> tuple[ReviewProvider, ...]:
+    if value is None:
+        if require_sources:
+            raise ReviewAgentError("Each synthesized finding requires a non-empty sources array")
+        return ()
+    if not isinstance(value, list) or not value:
+        raise ReviewAgentError("finding sources must be a non-empty array when provided")
+
+    normalized: list[ReviewProvider] = []
+    for item in value:
+        provider = str(item).strip().lower()
+        if provider not in VALID_PROVIDERS:
+            raise ReviewAgentError(f"Invalid finding source provider: {provider!r}")
+        if provider not in normalized:
+            normalized.append(provider)  # type: ignore[arg-type]
+    if require_sources and not normalized:
+        raise ReviewAgentError("Each synthesized finding requires at least one source")
+    return tuple(normalized)
+
+
+def _parse_finding_opinions(value) -> tuple[ReviewOpinion, ...]:
+    if value is None:
+        return ()
+    if not isinstance(value, list):
+        raise ReviewAgentError("finding opinions must be an array when provided")
+
+    opinions: list[ReviewOpinion] = []
+    for item in value:
+        if not isinstance(item, dict):
+            raise ReviewAgentError("each finding opinion must be an object")
+        provider = str(item.get("provider", "")).strip().lower()
+        verdict = str(item.get("verdict", "")).strip().lower()
+        reason = str(item.get("reason", "")).strip()
+        if provider not in VALID_PROVIDERS:
+            raise ReviewAgentError(f"Invalid finding opinion provider: {provider!r}")
+        if verdict not in VALID_OPINION_VERDICTS:
+            raise ReviewAgentError(f"Invalid finding opinion verdict: {verdict!r}")
+        opinions.append(
+            ReviewOpinion(
+                provider=provider,  # type: ignore[arg-type]
+                verdict=verdict,  # type: ignore[arg-type]
+                reason=reason or None,
+            )
+        )
+    return tuple(opinions)
+
+
+def _reconcile_council_findings(
+    final_result: ReviewResult,
+    codex_result: ReviewResult,
+    claude_result: ReviewResult,
+) -> tuple[ReviewResult, int, int]:
+    reconciled = list(final_result.findings)
+    preserved_count = 0
+    attribution_updates = 0
+
+    for provider, base_result in (("codex", codex_result), ("claude", claude_result)):
+        for base_finding in base_result.findings:
+            match_index = _find_covering_finding_index(reconciled, base_finding)
+            if match_index is None:
+                reconciled.append(_preserved_base_finding(base_finding, provider))
+                preserved_count += 1
+                continue
+
+            updated_finding, changed = _merge_provider_attribution(reconciled[match_index], base_finding, provider)
+            if changed:
+                reconciled[match_index] = updated_finding
+                attribution_updates += 1
+
+    overall_risk = _highest_severity(final_result.overall_risk, *(finding.severity for finding in reconciled))
+    summary = final_result.summary.strip()
+    if preserved_count:
+        summary = f"{summary} Preserved {preserved_count} finding(s) from the base reviews.".strip()
+
+    return (
+        ReviewResult(
+            summary=summary,
+            overall_risk=overall_risk,
+            findings=tuple(reconciled),
+            token_usage=final_result.token_usage,
+            agent_metadata=final_result.agent_metadata,
+            participants=final_result.participants,
+        ),
+        preserved_count,
+        attribution_updates,
+    )
+
+
+def _find_covering_finding_index(findings: list[ReviewFinding], base_finding: ReviewFinding) -> int | None:
+    for index, finding in enumerate(findings):
+        if findings_match(finding, base_finding):
+            return index
+    return None
+
+
+def _merge_provider_attribution(
+    finding: ReviewFinding,
+    base_finding: ReviewFinding,
+    provider: ReviewProvider,
+) -> tuple[ReviewFinding, bool]:
+    changed = False
+
+    sources = list(finding.sources)
+    if provider not in sources:
+        sources.append(provider)
+        changed = True
+
+    opinions = list(finding.opinions)
+    if not any(opinion.provider == provider for opinion in opinions):
+        opinions.append(
+            ReviewOpinion(
+                provider=provider,
+                verdict="found",
+                reason=f"Raised in the {provider} base review.",
+            )
+        )
+        changed = True
+
+    if not changed:
+        return finding, False
+
+    normalized_sources = tuple(sorted(dict.fromkeys(sources)))
+    return (
+        ReviewFinding(
+            severity=finding.severity,
+            file=finding.file,
+            line=finding.line,
+            title=finding.title,
+            body=finding.body,
+            suggestion=finding.suggestion or base_finding.suggestion,
+            sources=normalized_sources,  # type: ignore[arg-type]
+            opinions=tuple(opinions),
+            snippet=finding.snippet,
+            snippet_start_line=finding.snippet_start_line,
+            snippet_language=finding.snippet_language,
+        ),
+        True,
+    )
+
+
+def _preserved_base_finding(finding: ReviewFinding, provider: ReviewProvider) -> ReviewFinding:
+    return ReviewFinding(
+        severity=finding.severity,
+        file=finding.file,
+        line=finding.line,
+        title=finding.title,
+        body=finding.body,
+        suggestion=finding.suggestion,
+        sources=(provider,),
+        opinions=(
+            ReviewOpinion(
+                provider=provider,
+                verdict="found",
+                reason=f"Preserved from the {provider} base review after synthesis omitted it.",
+            ),
+        ),
+        snippet=finding.snippet,
+        snippet_start_line=finding.snippet_start_line,
+        snippet_language=finding.snippet_language,
+    )
+
+
+def _highest_severity(initial: str, *values: str) -> str:
+    ranking = {"high": 0, "medium": 1, "low": 2}
+    best = initial
+    for value in values:
+        if ranking[value] < ranking[best]:
+            best = value
+    return best
+
+
+def _summarize_participants(runs: list[_ProviderRun]) -> tuple[ReviewParticipant, ...]:
+    summaries: dict[tuple[str, str | None, str | None], ReviewParticipant] = {}
+    for run in runs:
+        key = (run.provider, run.metadata.model, run.metadata.reasoning_effort)
+        current = summaries.get(key)
+        phases = tuple(dict.fromkeys((*(current.phases if current else ()), run.phase)))
+        usage = _merge_token_usage(current.token_usage if current else None, run.token_usage)
+        summaries[key] = ReviewParticipant(
+            metadata=run.metadata,
+            phases=phases,
+            token_usage=usage,
+        )
+    return tuple(
+        participant
+        for _, participant in sorted(
+            summaries.items(),
+            key=lambda item: (
+                0 if item[1].metadata.provider == "codex" else 1,
+                0 if "review" in item[1].phases else 1,
+                item[1].metadata.reasoning_effort or "",
+            ),
+        )
+    )
+
+
+def _merge_token_usage(
+    base: ReviewTokenUsage | None,
+    update: ReviewTokenUsage | None,
+) -> ReviewTokenUsage | None:
+    if base is None:
+        return update
+    if update is None:
+        return base
+    return ReviewTokenUsage(
+        input_tokens=base.input_tokens + update.input_tokens,
+        cached_input_tokens=base.cached_input_tokens + update.cached_input_tokens,
+        output_tokens=base.output_tokens + update.output_tokens,
+        cache_creation_input_tokens=base.cache_creation_input_tokens + update.cache_creation_input_tokens,
+        cost_usd=((base.cost_usd or 0.0) + (update.cost_usd or 0.0)) if (base.cost_usd is not None or update.cost_usd is not None) else None,
+        cached_input_included_in_input=base.cached_input_included_in_input,
+        cache_creation_included_in_input=base.cache_creation_included_in_input,
+    )
+
+
+def _token_usage_to_payload(token_usage: ReviewTokenUsage | None) -> dict | None:
+    if token_usage is None:
+        return None
+    return {
+        "input_tokens": token_usage.input_tokens,
+        "cached_input_tokens": token_usage.cached_input_tokens,
+        "cache_creation_input_tokens": token_usage.cache_creation_input_tokens,
+        "output_tokens": token_usage.output_tokens,
+        "total_tokens": token_usage.total_tokens,
+        "cost_usd": token_usage.cost_usd,
+    }
 
 
 def _run_command(
@@ -427,51 +955,6 @@ def _build_claude_token_usage(
     )
 
 
-def _parse_review_result(raw: str) -> ReviewResult:
-    payload = _load_json_object(raw)
-    summary = str(payload.get("summary", "")).strip()
-    overall_risk = str(payload.get("overall_risk", "")).strip().lower()
-    if not summary:
-        raise ReviewAgentError("Missing summary field")
-    if overall_risk not in VALID_SEVERITIES:
-        raise ReviewAgentError(f"Invalid overall_risk value: {overall_risk!r}")
-
-    findings_payload = payload.get("findings", [])
-    if not isinstance(findings_payload, list):
-        raise ReviewAgentError("findings must be an array")
-
-    findings: list[ReviewFinding] = []
-    for item in findings_payload:
-        severity = str(item.get("severity", "")).strip().lower()
-        file_path = str(item.get("file", "")).strip()
-        title = str(item.get("title", "")).strip()
-        body = str(item.get("body", "")).strip()
-        suggestion = str(item.get("suggestion", "")).strip()
-        line = item.get("line")
-        if severity not in VALID_SEVERITIES:
-            raise ReviewAgentError(f"Invalid finding severity: {severity!r}")
-        if not file_path or not title or not body:
-            raise ReviewAgentError("Each finding requires file, title, and body")
-        if not isinstance(line, int) or line < 1:
-            raise ReviewAgentError("Each finding line must be a positive integer")
-        findings.append(
-            ReviewFinding(
-                severity=severity,
-                file=file_path,
-                line=line,
-                title=title,
-                body=body,
-                suggestion=suggestion or None,
-            )
-        )
-
-    return ReviewResult(
-        summary=summary,
-        overall_risk=overall_risk,
-        findings=tuple(findings),
-    )
-
-
 def _load_json_object(raw: str) -> dict:
     candidate = raw.strip()
     if not candidate:
@@ -528,7 +1011,7 @@ def _extract_agent_metadata(provider_name: str, command: tuple[str, ...]) -> Rev
         index += 1
 
     return ReviewAgentMetadata(
-        provider=provider_name,
+        provider=provider_name,  # type: ignore[arg-type]
         model=_clean_value(model),
         reasoning_effort=_clean_value(reasoning_effort),
     )

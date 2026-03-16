@@ -1,6 +1,8 @@
 # Nimble Reviewer
 
-Containerized GitLab merge request review bot. The service accepts GitLab merge request webhooks, queues persisted review runs in SQLite, checks out the MR, invokes either Codex CLI or Claude Code against the diff plus repository context, and upserts a single bot comment back into the merge request.
+Containerized GitLab merge request review bot. The service accepts GitLab merge request webhooks, queues persisted review runs in SQLite, checks out the MR, runs Codex and Claude Code reviews in parallel, then lets a final synthesis model produce one bot comment back into the merge request.
+
+Review runs are triggered when a non-draft MR is opened or reopened, and when an existing MR moves from draft to ready. Pushing new commits to an already open MR does not trigger an automatic re-review.
 
 ## Repository-specific review rules
 
@@ -36,7 +38,8 @@ Repository rules are capped before being injected into the prompt so an oversize
 - `GITLAB_URL`
 - `GITLAB_TOKEN`
 - `GITLAB_WEBHOOK_SECRET`
-- `REVIEW_AGENT_PROVIDER`
+- `CODEX_CMD`
+- `CLAUDE_CMD`
 - `SQLITE_PATH`
 - `REPO_CACHE_DIR`
 - `REVIEW_TIMEOUT_SEC`
@@ -44,31 +47,29 @@ Repository rules are capped before being injected into the prompt so an oversize
 
 Optional:
 
-- `CODEX_CMD` required when `REVIEW_AGENT_PROVIDER=codex`
-- `CLAUDE_CMD` required when `REVIEW_AGENT_PROVIDER=claude`
+- `COUNCIL_SYNTHESIS_PROVIDER` defaults to `codex`
+- `COUNCIL_SYNTHESIS_CMD` defaults to Codex `gpt-5.4` with `low` reasoning, or Claude `sonnet` with `low` reasoning if the synthesis provider is set to `claude`
 - `REVIEW_TRACE_DIR` defaults to `/data/review-traces`
 - `GITLAB_GIT_USERNAME` defaults to `oauth2`
 - `PORT` defaults to `8080` and controls the HTTP port inside the container
 - `HOST_PORT` defaults to `8080` and controls the published port on the host in `docker compose`
 - any auth env required by the configured CLI command if you choose API-key auth
 
-## Review agent selection
+## Review council configuration
 
-Use `REVIEW_AGENT_PROVIDER` to choose the backend:
+The service always runs the same three-step council flow:
 
-- `codex`
-- `claude`
+1. Codex base review
+2. Claude base review
+3. Final synthesis into one MR note using both base reviews
 
-Recommended examples:
-
-```env
-REVIEW_AGENT_PROVIDER=codex
-CODEX_CMD=codex exec -
-```
+Default command behavior:
 
 ```env
-REVIEW_AGENT_PROVIDER=claude
-CLAUDE_CMD=claude -p --output-format stream-json
+CODEX_CMD=codex exec -m gpt-5.4 -c model_reasoning_effort="high" -
+CLAUDE_CMD=claude -p --output-format stream-json --model sonnet --effort high --permission-mode bypassPermissions
+COUNCIL_SYNTHESIS_PROVIDER=codex
+COUNCIL_SYNTHESIS_CMD=codex exec -m gpt-5.4 -c model_reasoning_effort="low" -
 ```
 
 For Codex, the command should read the prompt from `stdin` and print the final review JSON to `stdout`.
@@ -105,11 +106,11 @@ For Claude runs, the trace includes:
 
 The MR note stays intentionally short. It includes:
 
-- agent name
-- model
-- reasoning effort when it can be inferred from the CLI command
+- council participants
+- model and reasoning effort for each participant
 - token usage when available
 - Claude `cost_usd` when available
+- per-finding model attribution: `codex`, `claude`, or `both`
 
 It does not include a separate `Review Trace` section.
 
@@ -161,7 +162,7 @@ This publishes the service on host port `18080`, so the webhook URL is `http://<
 
 ## Authentication modes
 
-The service authenticates through the selected CLI.
+The service authenticates through both configured CLIs.
 
 ### Codex
 
@@ -213,16 +214,13 @@ docker build -t nimble-reviewer:latest .
 
 The compose file also persists `/home/reviewer/.claude` so Claude Code login and settings survive container recreation.
 
-If you want to use Claude Code instead of Codex:
-
-1. Set `REVIEW_AGENT_PROVIDER=claude`
-2. Set `CLAUDE_CMD`, for example:
+The council always uses Claude Code. You can customize the command if needed, for example:
 
 ```env
-CLAUDE_CMD=claude -p --output-format stream-json
+CLAUDE_CMD=claude -p --output-format stream-json --model sonnet --effort high --permission-mode bypassPermissions
 ```
 
-3. Start the service and authenticate Claude inside the container:
+Then start the service and authenticate Claude inside the container:
 
 ```bash
 docker compose exec -it nimble-reviewer claude

@@ -1,6 +1,9 @@
 from __future__ import annotations
 
-from nimble_reviewer.models import MergeRequestInfo
+import json
+
+from nimble_reviewer.models import MergeRequestInfo, ReviewResult
+
 
 MAX_DIFF_CHARS = 200_000
 
@@ -86,3 +89,87 @@ Unified diff:
 ```diff
 {diff_text}
 ```"""
+
+
+def build_council_synthesis_prompt(
+    base_review_prompt: str,
+    codex_result: ReviewResult,
+    claude_result: ReviewResult,
+) -> str:
+    return f"""You are the final synthesis reviewer for a merge request review council.
+
+Return only strict JSON with this shape:
+{{
+  "summary": "short final review summary",
+  "overall_risk": "high|medium|low",
+  "findings": [
+    {{
+      "severity": "high|medium|low",
+      "file": "path/to/file.py",
+      "line": 123,
+      "title": "short title",
+      "body": "actionable explanation",
+      "suggestion": "optional short fix direction",
+      "sources": ["codex"] | ["claude"] | ["codex", "claude"],
+      "opinions": [
+        {{
+          "provider": "codex|claude",
+          "verdict": "found|agree|disagree|uncertain",
+          "reason": "optional short rationale"
+        }}
+      ]
+    }}
+  ]
+}}
+
+Rules:
+- Produce the final actionable review output for the merge request.
+- Use the two base reviews as inputs.
+- Do not drop findings from either base review.
+- Every base-review finding must appear in the final output either as a merged issue or as its own standalone issue.
+- You may merge findings when they clearly refer to the same underlying problem.
+- Use `sources` only for the models that independently found the issue in their base reviews.
+- Use `sources=["codex","claude"]` only when both base reviews independently surfaced the same underlying issue.
+- `opinions` is optional, but include it when it improves transparency about how each model viewed the final finding.
+- Use `found` when the model raised the issue in its own base review.
+- Use `agree` when the model did not raise it independently but would keep it in the final review.
+- Use `disagree` when the model's base review conflicts with keeping that issue.
+- Use `uncertain` when the support is mixed or weak.
+- Prefer keeping unique but credible findings from one model instead of dropping them.
+- Your job is synthesis and de-duplication, not suppression.
+- Omit praise and style nits unless they represent a real risk.
+- Keep the final summary concise.
+
+Original review brief:
+{base_review_prompt}
+
+Codex base review:
+```json
+{_render_review_result_json(codex_result)}
+```
+
+Claude base review:
+```json
+{_render_review_result_json(claude_result)}
+```
+"""
+
+
+def _render_review_result_json(result: ReviewResult) -> str:
+    payload = {
+        "summary": result.summary,
+        "overall_risk": result.overall_risk,
+        "findings": [
+            {
+                "severity": finding.severity,
+                "file": finding.file,
+                "line": finding.line,
+                "title": finding.title,
+                "body": finding.body,
+                **({"suggestion": finding.suggestion} if finding.suggestion else {}),
+                **({"sources": list(finding.sources)} if finding.sources else {}),
+            }
+            for finding in result.findings
+        ],
+    }
+    return json.dumps(payload, indent=2, sort_keys=True)

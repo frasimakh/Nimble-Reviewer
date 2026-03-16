@@ -1,13 +1,15 @@
 from __future__ import annotations
 
 import logging
+import json
 import time
 from dataclasses import dataclass
 from pathlib import Path
 
+from nimble_reviewer.finding_match import findings_match
 from nimble_reviewer.gitlab import GitLabClient
 from nimble_reviewer.gitops import RepoManager
-from nimble_reviewer.models import ReviewFinding, ReviewResult, ReviewRun
+from nimble_reviewer.models import ReviewAgentMetadata, ReviewComparison, ReviewFinding, ReviewFindingState, ReviewOpinion, ReviewParticipant, ReviewResult, ReviewRun, ReviewTokenUsage
 from nimble_reviewer.prompts import build_review_prompt
 from nimble_reviewer.review_agent import ReviewAgentRunner
 from nimble_reviewer.renderer import note_marker, render_failure_note, render_success_note
@@ -140,10 +142,14 @@ class ReviewService:
                         provider=self.review_agent.provider_name,
                         prompt_bytes=len(prompt.encode("utf-8")),
                         diff_bytes=len(checkout.diff_text.encode("utf-8")),
-                )
+                    )
                 agent_started = time.monotonic()
                 result = self.review_agent.review(prompt, checkout.path, trace=trace)
                 result = _enrich_result_for_rendering(result, checkout.path)
+                previous_result = self._load_previous_success_result(run)
+                comparison = _build_review_comparison(previous_result, result)
+                if trace:
+                    trace.write_snapshot("review.final", _review_result_snapshot_payload(result))
                 LOGGER.info(
                     "%s finished run_id=%s findings=%s overall_risk=%s agent_sec=%.2f",
                     self.review_agent.provider_name,
@@ -162,6 +168,7 @@ class ReviewService:
                         overall_risk=result.overall_risk,
                         token_usage=_token_usage_payload(result),
                         agent_metadata=_agent_metadata_payload(result),
+                        participants=_participants_payload(result),
                     )
             finally:
                 checkout.close()
@@ -181,7 +188,7 @@ class ReviewService:
                     trace.write("app", "review.stale_before_publish", run_id=run.id)
                 return
 
-            note = self._upsert_success_note(run.project_id, run.mr_iid, run.source_sha, result)
+            note = self._upsert_success_note(run.project_id, run.mr_iid, run.source_sha, result, comparison)
             self.store.update_note_id(run.project_id, run.mr_iid, note.id)
             self.store.mark_done(run.id, run.project_id, run.mr_iid, run.source_sha)
             LOGGER.info(
@@ -215,11 +222,11 @@ class ReviewService:
                 if trace:
                     trace.write("app", "failure_note.publish_failed", run_id=run.id)
 
-    def _upsert_success_note(self, project_id: int, mr_iid: int, source_sha: str, result):
+    def _upsert_success_note(self, project_id: int, mr_iid: int, source_sha: str, result, comparison: ReviewComparison):
         state = self.store.get_merge_request_state(project_id, mr_iid)
         marker = note_marker(project_id, mr_iid)
         existing = self.gitlab.find_bot_note(project_id, mr_iid, marker, state.note_id if state else None)
-        body = render_success_note(project_id, mr_iid, source_sha, result)
+        body = render_success_note(project_id, mr_iid, source_sha, result, comparison=comparison)
         if existing:
             LOGGER.info(
                 "Updating success note project=%s mr=%s note_id=%s sha=%s findings=%s",
@@ -266,6 +273,21 @@ class ReviewService:
         )
         return self.gitlab.create_note(project_id, mr_iid, body)
 
+    def _load_previous_success_result(self, run: ReviewRun) -> ReviewResult | None:
+        previous_run = self.store.get_latest_done_run(run.project_id, run.mr_iid)
+        if not previous_run:
+            return None
+        snapshot_path = self.trace_settings.directory / f"run-{previous_run.id}.review.final.json"
+        if not snapshot_path.is_file():
+            LOGGER.info("Previous review snapshot missing run_id=%s path=%s", previous_run.id, snapshot_path)
+            return None
+        try:
+            payload = json.loads(snapshot_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            LOGGER.exception("Failed to load previous review snapshot run_id=%s path=%s", previous_run.id, snapshot_path)
+            return None
+        return _review_result_from_snapshot_payload(payload)
+
 
 def _short_sha(value: str | None) -> str:
     if not value:
@@ -273,16 +295,17 @@ def _short_sha(value: str | None) -> str:
     return value[:12]
 
 
-def _token_usage_payload(result) -> dict | None:
-    if not result.token_usage:
+def _token_usage_payload(result_or_usage) -> dict | None:
+    token_usage = getattr(result_or_usage, "token_usage", result_or_usage)
+    if not token_usage:
         return None
     return {
-        "input_tokens": result.token_usage.input_tokens,
-        "cached_input_tokens": result.token_usage.cached_input_tokens,
-        "cache_creation_input_tokens": result.token_usage.cache_creation_input_tokens,
-        "output_tokens": result.token_usage.output_tokens,
-        "total_tokens": result.token_usage.total_tokens,
-        "cost_usd": result.token_usage.cost_usd,
+        "input_tokens": token_usage.input_tokens,
+        "cached_input_tokens": token_usage.cached_input_tokens,
+        "cache_creation_input_tokens": token_usage.cache_creation_input_tokens,
+        "output_tokens": token_usage.output_tokens,
+        "total_tokens": token_usage.total_tokens,
+        "cost_usd": token_usage.cost_usd,
     }
 
 
@@ -296,6 +319,58 @@ def _agent_metadata_payload(result) -> dict | None:
     }
 
 
+def _participants_payload(result) -> list[dict] | None:
+    if not getattr(result, "participants", None):
+        return None
+    payload: list[dict] = []
+    for participant in result.participants:
+        payload.append(
+            {
+                "provider": participant.metadata.provider,
+                "model": participant.metadata.model,
+                "reasoning_effort": participant.metadata.reasoning_effort,
+                "phases": list(participant.phases),
+                "token_usage": _token_usage_payload(participant.token_usage),
+            }
+        )
+    return payload
+
+
+def _build_review_comparison(previous: ReviewResult | None, current: ReviewResult) -> ReviewComparison:
+    if previous is None:
+        return ReviewComparison(
+            current_findings=tuple(ReviewFindingState(finding=finding, status="new") for finding in current.findings),
+            resolved_findings=(),
+        )
+
+    matched_previous: set[int] = set()
+    current_findings: list[ReviewFindingState] = []
+    for finding in current.findings:
+        previous_index = next(
+            (
+                index
+                for index, previous_finding in enumerate(previous.findings)
+                if index not in matched_previous and findings_match(finding, previous_finding)
+            ),
+            None,
+        )
+        if previous_index is None:
+            current_findings.append(ReviewFindingState(finding=finding, status="new"))
+            continue
+        matched_previous.add(previous_index)
+        current_findings.append(ReviewFindingState(finding=finding, status="still_present"))
+
+    resolved = tuple(
+        finding
+        for index, finding in enumerate(previous.findings)
+        if index not in matched_previous
+    )
+    return ReviewComparison(
+        current_findings=tuple(current_findings),
+        resolved_findings=resolved,
+    )
+
+
 def _enrich_result_for_rendering(result: ReviewResult, checkout_path: Path) -> ReviewResult:
     if not result.findings:
         return result
@@ -306,6 +381,128 @@ def _enrich_result_for_rendering(result: ReviewResult, checkout_path: Path) -> R
         findings=enriched,
         token_usage=result.token_usage,
         agent_metadata=result.agent_metadata,
+        participants=result.participants,
+    )
+
+
+def _review_result_snapshot_payload(result: ReviewResult) -> dict:
+    return {
+        "summary": result.summary,
+        "overall_risk": result.overall_risk,
+        "findings": [_finding_snapshot_payload(finding) for finding in result.findings],
+        "token_usage": _token_usage_snapshot_payload(result.token_usage),
+        "agent_metadata": _agent_metadata_payload(result),
+        "participants": _participants_payload(result),
+    }
+
+
+def _finding_snapshot_payload(finding: ReviewFinding) -> dict:
+    return {
+        "severity": finding.severity,
+        "file": finding.file,
+        "line": finding.line,
+        "title": finding.title,
+        "body": finding.body,
+        "suggestion": finding.suggestion,
+        "sources": list(finding.sources),
+        "opinions": [
+            {
+                "provider": opinion.provider,
+                "verdict": opinion.verdict,
+                "reason": opinion.reason,
+            }
+            for opinion in finding.opinions
+        ],
+        "snippet": finding.snippet,
+        "snippet_start_line": finding.snippet_start_line,
+        "snippet_language": finding.snippet_language,
+    }
+
+
+def _token_usage_snapshot_payload(token_usage: ReviewTokenUsage | None) -> dict | None:
+    if token_usage is None:
+        return None
+    return {
+        "input_tokens": token_usage.input_tokens,
+        "cached_input_tokens": token_usage.cached_input_tokens,
+        "output_tokens": token_usage.output_tokens,
+        "cache_creation_input_tokens": token_usage.cache_creation_input_tokens,
+        "cost_usd": token_usage.cost_usd,
+        "cached_input_included_in_input": token_usage.cached_input_included_in_input,
+        "cache_creation_included_in_input": token_usage.cache_creation_included_in_input,
+    }
+
+
+def _review_result_from_snapshot_payload(payload: dict) -> ReviewResult:
+    findings = tuple(_finding_from_snapshot_payload(item) for item in payload.get("findings", []))
+    agent_metadata = payload.get("agent_metadata") or {}
+    participants_payload = payload.get("participants") or []
+    return ReviewResult(
+        summary=str(payload.get("summary", "")),
+        overall_risk=str(payload.get("overall_risk", "low")),
+        findings=findings,
+        token_usage=_token_usage_from_snapshot_payload(payload.get("token_usage")),
+        agent_metadata=(
+            None
+            if not agent_metadata
+            else ReviewAgentMetadata(
+                provider=str(agent_metadata.get("provider", "")),
+                model=agent_metadata.get("model"),
+                reasoning_effort=agent_metadata.get("reasoning_effort"),
+            )
+        ),
+        participants=tuple(_participant_from_snapshot_payload(item) for item in participants_payload),
+    )
+
+
+def _finding_from_snapshot_payload(payload: dict) -> ReviewFinding:
+    return ReviewFinding(
+        severity=str(payload.get("severity", "low")),
+        file=str(payload.get("file", "")),
+        line=int(payload.get("line", 1)),
+        title=str(payload.get("title", "")),
+        body=str(payload.get("body", "")),
+        suggestion=payload.get("suggestion"),
+        sources=tuple(payload.get("sources", ())),
+        opinions=tuple(
+            ReviewOpinion(
+                provider=str(item.get("provider", "")),
+                verdict=str(item.get("verdict", "")),
+                reason=item.get("reason"),
+            )
+            for item in payload.get("opinions", [])
+        ),
+        snippet=payload.get("snippet"),
+        snippet_start_line=payload.get("snippet_start_line"),
+        snippet_language=payload.get("snippet_language"),
+    )
+
+
+def _token_usage_from_snapshot_payload(payload: dict | None) -> ReviewTokenUsage | None:
+    if not payload:
+        return None
+    return ReviewTokenUsage(
+        input_tokens=int(payload.get("input_tokens", 0)),
+        cached_input_tokens=int(payload.get("cached_input_tokens", 0)),
+        output_tokens=int(payload.get("output_tokens", 0)),
+        cache_creation_input_tokens=int(payload.get("cache_creation_input_tokens", 0)),
+        cost_usd=payload.get("cost_usd"),
+        cached_input_included_in_input=bool(payload.get("cached_input_included_in_input", True)),
+        cache_creation_included_in_input=bool(payload.get("cache_creation_included_in_input", True)),
+    )
+
+
+def _participant_from_snapshot_payload(payload: dict) -> ReviewParticipant:
+    metadata_payload = payload.get("metadata") or payload
+
+    return ReviewParticipant(
+        metadata=ReviewAgentMetadata(
+            provider=str(metadata_payload.get("provider", "")),
+            model=metadata_payload.get("model"),
+            reasoning_effort=metadata_payload.get("reasoning_effort"),
+        ),
+        phases=tuple(payload.get("phases", ())),
+        token_usage=_token_usage_from_snapshot_payload(payload.get("token_usage")),
     )
 
 
@@ -320,6 +517,8 @@ def _enrich_finding(finding: ReviewFinding, checkout_path: Path) -> ReviewFindin
         title=finding.title,
         body=finding.body,
         suggestion=finding.suggestion,
+        sources=finding.sources,
+        opinions=finding.opinions,
         snippet=snippet,
         snippet_start_line=snippet_start_line,
         snippet_language=snippet_language,

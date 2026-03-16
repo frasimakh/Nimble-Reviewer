@@ -1,6 +1,7 @@
 import json
 import unittest
 
+from nimble_reviewer.models import ReviewAgentMetadata, ReviewFinding, ReviewResult, ReviewTokenUsage
 from nimble_reviewer.review_agent import ReviewAgentError
 
 
@@ -194,6 +195,195 @@ class ReviewAgentTests(unittest.TestCase):
 
         self.assertEqual(command.count("--verbose"), 1)
 
+    def test_council_runner_combines_two_reviews_and_separate_synthesis_profile(self):
+        from pathlib import Path
+
+        from nimble_reviewer.review_agent import CouncilRunner
+
+        codex_review_runner = _FakeJsonRunner(
+            provider="codex",
+            model="gpt-5.4",
+            reasoning="high",
+            review_result=ReviewResult(
+                summary="Codex found one issue.",
+                overall_risk="medium",
+                findings=(ReviewFinding("medium", "app.py", 10, "Null guard", "Need a guard."),),
+                token_usage=ReviewTokenUsage(input_tokens=10, cached_input_tokens=2, output_tokens=3),
+            ),
+        )
+        claude_review_runner = _FakeJsonRunner(
+            provider="claude",
+            model="sonnet",
+            reasoning="high",
+            review_result=ReviewResult(
+                summary="Claude found the same issue.",
+                overall_risk="medium",
+                findings=(ReviewFinding("medium", "app.py", 11, "Missing guard", "Still needs a guard."),),
+                token_usage=ReviewTokenUsage(
+                    input_tokens=20,
+                    cached_input_tokens=5,
+                    output_tokens=6,
+                    cache_creation_input_tokens=7,
+                    cached_input_included_in_input=False,
+                    cache_creation_included_in_input=False,
+                ),
+            ),
+        )
+        codex_synth_runner = _FakeJsonRunner(
+            provider="codex",
+            model="gpt-5.4",
+            reasoning="low",
+            json_responses=[
+                (
+                    {
+                        "summary": "One shared actionable issue.",
+                        "overall_risk": "medium",
+                        "findings": [
+                            {
+                                "severity": "medium",
+                                "file": "app.py",
+                                "line": 10,
+                                "title": "Missing null guard",
+                                "body": "Guard the value before indexing.",
+                                "suggestion": "Add an early return before indexing.",
+                                "sources": ["codex", "claude"],
+                                "opinions": [
+                                    {"provider": "codex", "verdict": "found", "reason": "Flagged the guard issue directly."},
+                                    {"provider": "claude", "verdict": "found", "reason": "Raised the same issue independently."},
+                                ],
+                            }
+                        ],
+                    },
+                    ReviewTokenUsage(input_tokens=6, cached_input_tokens=1, output_tokens=2),
+                ),
+            ],
+        )
+
+        runner = CouncilRunner(
+            codex_runner=codex_review_runner,
+            claude_runner=claude_review_runner,
+            synthesizer=codex_synth_runner,
+        )
+
+        result = runner.review("base prompt", Path("."))
+
+        self.assertEqual(result.summary, "One shared actionable issue.")
+        self.assertEqual(result.findings[0].sources, ("codex", "claude"))
+        self.assertEqual(len(result.findings[0].opinions), 2)
+        self.assertEqual(len(result.participants), 3)
+        self.assertEqual(result.participants[0].phases, ("review",))
+        self.assertEqual(result.participants[1].metadata.provider, "codex")
+        self.assertEqual(result.participants[1].metadata.reasoning_effort, "low")
+        self.assertEqual(result.participants[1].phases, ("synthesis",))
+        self.assertEqual(result.participants[2].metadata.provider, "claude")
+        self.assertEqual(result.participants[2].phases, ("review",))
+
+    def test_council_runner_writes_stage_snapshots(self):
+        from pathlib import Path
+
+        from nimble_reviewer.review_agent import CouncilRunner
+
+        trace = _MemoryTrace()
+        codex_review_runner = _FakeJsonRunner(
+            provider="codex",
+            model="gpt-5.4",
+            reasoning="high",
+            review_result=ReviewResult(summary="Codex", overall_risk="low", findings=()),
+        )
+        claude_review_runner = _FakeJsonRunner(
+            provider="claude",
+            model="sonnet",
+            reasoning="high",
+            review_result=ReviewResult(summary="Claude", overall_risk="low", findings=()),
+        )
+        synthesizer = _FakeJsonRunner(
+            provider="codex",
+            model="gpt-5.4",
+            reasoning="low",
+            json_responses=[({"summary": "Final", "overall_risk": "low", "findings": []}, None)],
+        )
+
+        runner = CouncilRunner(
+            codex_runner=codex_review_runner,
+            claude_runner=claude_review_runner,
+            synthesizer=synthesizer,
+        )
+
+        runner.review("base prompt", Path("."), trace=trace)
+
+        self.assertIn("codex.review", trace.snapshots)
+        self.assertIn("claude.review", trace.snapshots)
+        self.assertIn("codex.synthesis", trace.snapshots)
+
+    def test_council_runner_preserves_findings_omitted_by_synthesis(self):
+        from pathlib import Path
+
+        from nimble_reviewer.review_agent import CouncilRunner
+
+        codex_review_runner = _FakeJsonRunner(
+            provider="codex",
+            model="gpt-5.4",
+            reasoning="high",
+            review_result=ReviewResult(
+                summary="Codex found two issues.",
+                overall_risk="high",
+                findings=(
+                    ReviewFinding("high", "app.py", 10, "Null guard", "Need a guard."),
+                    ReviewFinding("medium", "db.py", 20, "Retry logic", "Missing retry on timeout."),
+                ),
+            ),
+        )
+        claude_review_runner = _FakeJsonRunner(
+            provider="claude",
+            model="sonnet",
+            reasoning="high",
+            review_result=ReviewResult(
+                summary="Claude found one issue.",
+                overall_risk="medium",
+                findings=(
+                    ReviewFinding("medium", "worker.py", 30, "Cleanup ordering", "Cleanup can run too early."),
+                ),
+            ),
+        )
+        codex_synth_runner = _FakeJsonRunner(
+            provider="codex",
+            model="gpt-5.4",
+            reasoning="low",
+            json_responses=[
+                (
+                    {
+                        "summary": "Only one issue made it into synthesis.",
+                        "overall_risk": "medium",
+                        "findings": [
+                            {
+                                "severity": "high",
+                                "file": "app.py",
+                                "line": 10,
+                                "title": "Null guard",
+                                "body": "Need a guard.",
+                                "sources": ["codex"],
+                            }
+                        ],
+                    },
+                    ReviewTokenUsage(input_tokens=6, cached_input_tokens=1, output_tokens=2),
+                ),
+            ],
+        )
+
+        runner = CouncilRunner(
+            codex_runner=codex_review_runner,
+            claude_runner=claude_review_runner,
+            synthesizer=codex_synth_runner,
+        )
+
+        result = runner.review("base prompt", Path("."))
+
+        self.assertEqual(len(result.findings), 3)
+        self.assertTrue(any(f.file == "db.py" and f.sources == ("codex",) for f in result.findings))
+        self.assertTrue(any(f.file == "worker.py" and f.sources == ("claude",) for f in result.findings))
+        self.assertIn("Preserved 2 finding(s) from the base reviews.", result.summary)
+        self.assertEqual(result.overall_risk, "high")
+
 
 def _parse_with_claude_envelope(raw: str) -> dict:
     from nimble_reviewer.review_agent import _extract_claude_result, _load_json_object
@@ -246,9 +436,38 @@ def _extract_claude_result_from_stream(raw: str) -> dict:
 class _MemoryTrace:
     def __init__(self):
         self.entries = []
+        self.snapshots = {}
 
     def write(self, source, event, **payload):
         self.entries.append({"source": source, "event": event, **payload})
+
+    def write_snapshot(self, name, payload):
+        self.snapshots[name] = payload
+
+
+class _FakeJsonRunner:
+    def __init__(
+        self,
+        provider: str,
+        model: str,
+        reasoning: str,
+        review_result: ReviewResult | None = None,
+        json_responses: list[tuple[dict, ReviewTokenUsage | None]] | None = None,
+    ):
+        self.provider_name = provider
+        self.agent_metadata = ReviewAgentMetadata(provider=provider, model=model, reasoning_effort=reasoning)
+        self._review_result = review_result
+        self._json_responses = list(json_responses or [])
+
+    def review(self, prompt, cwd, trace=None):
+        if self._review_result is None:
+            raise AssertionError("Unexpected review() call")
+        return self._review_result
+
+    def run_json(self, prompt, cwd, trace=None):
+        if not self._json_responses:
+            raise AssertionError("Unexpected run_json() call")
+        return self._json_responses.pop(0)
 
 
 if __name__ == "__main__":

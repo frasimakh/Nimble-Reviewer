@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from datetime import UTC, datetime
 
-from nimble_reviewer.models import ReviewResult
+from nimble_reviewer.models import ReviewComparison, ReviewFindingState, ReviewParticipant, ReviewResult
 
 STATUS_START = "<!-- nimble-reviewer:status:start -->"
 STATUS_END = "<!-- nimble-reviewer:status:end -->"
@@ -16,9 +16,24 @@ def note_marker(project_id: int, mr_iid: int) -> str:
     return f"<!-- nimble-reviewer:{project_id}:{mr_iid} -->"
 
 
-def render_success_note(project_id: int, mr_iid: int, source_sha: str, result: ReviewResult) -> str:
+def render_success_note(
+    project_id: int,
+    mr_iid: int,
+    source_sha: str,
+    result: ReviewResult,
+    comparison: ReviewComparison | None = None,
+) -> str:
     timestamp = datetime.now(UTC).strftime("%Y-%m-%d %H:%M:%SZ")
     findings = sorted(result.findings, key=lambda item: (SEVERITY_ORDER[item.severity], item.file, item.line))
+    comparison = comparison or _default_review_comparison(result)
+    current_findings = sorted(
+        comparison.current_findings,
+        key=lambda item: (SEVERITY_ORDER[item.finding.severity], item.finding.file, item.finding.line),
+    )
+    resolved_findings = sorted(
+        comparison.resolved_findings,
+        key=lambda item: (SEVERITY_ORDER[item.severity], item.file, item.line),
+    )
 
     lines = [
         "# Nimble Reviewer",
@@ -27,26 +42,39 @@ def render_success_note(project_id: int, mr_iid: int, source_sha: str, result: R
         "",
     ]
 
-    if result.agent_metadata:
-        lines.extend([_render_agent_metadata(result.agent_metadata), ""])
-
-    if result.token_usage:
-        lines.extend([_render_token_usage(result.token_usage), ""])
+    if result.participants:
+        lines.extend(["## Council", ""])
+        lines.extend(_render_council_sections(result.participants))
+        lines.append("")
+    else:
+        if result.agent_metadata:
+            lines.extend([_render_agent_metadata(result.agent_metadata), ""])
+        if result.token_usage:
+            lines.extend([_render_token_usage(result.token_usage), ""])
 
     lines.extend(["## Summary", "", f"Overall risk: **{result.overall_risk.upper()}**"])
     if findings:
         lines.append(_render_finding_counts(findings))
     else:
         lines.append("No actionable issues found.")
+    lines.append(_render_comparison_counts(comparison))
     lines.extend(["", result.summary.strip(), ""])
 
-    if findings:
-        lines.append("## Findings")
+    if current_findings:
+        lines.append("## Current findings")
         lines.append("")
-        for index, finding in enumerate(findings, start=1):
-            lines.extend(_render_finding_block(index, finding))
+        for index, finding_state in enumerate(current_findings, start=1):
+            lines.extend(_render_finding_block(index, finding_state))
     else:
-        lines.extend(["## Findings", "", "- No actionable issues found.", ""])
+        lines.extend(["## Current findings", "", "- No actionable issues found.", ""])
+
+    lines.extend(["## Resolved since previous review", ""])
+    if resolved_findings:
+        for finding in resolved_findings:
+            lines.append(_render_resolved_finding(finding))
+        lines.append("")
+    else:
+        lines.extend(["- No findings resolved since previous review.", ""])
 
     return _compose_note(project_id, mr_iid, "", "\n".join(lines).strip())
 
@@ -90,22 +118,8 @@ def _compose_note(project_id: int, mr_iid: int, status_block: str, review_block:
 
 
 def _render_token_usage(token_usage) -> str:
-    parts = [
-        "Tokens:",
-        f"`input={token_usage.input_tokens}`",
-        f"`cached_input={token_usage.cached_input_tokens}`",
-    ]
-    if getattr(token_usage, "cache_creation_input_tokens", 0):
-        parts.append(f"`cache_write={token_usage.cache_creation_input_tokens}`")
-    parts.extend(
-        [
-            f"`output={token_usage.output_tokens}`",
-            f"`total={token_usage.total_tokens}`",
-        ]
-    )
-    if getattr(token_usage, "cost_usd", None) is not None:
-        parts.append(f"`cost_usd={token_usage.cost_usd:.6f}`")
-    return " ".join(parts)
+    # Keep the note compact for now. Detailed usage remains in trace files.
+    return f"Tokens: `total={token_usage.total_tokens}`"
 
 
 def _render_agent_metadata(agent_metadata) -> str:
@@ -119,6 +133,40 @@ def _render_agent_metadata(agent_metadata) -> str:
     )
 
 
+def _render_participant(participant: ReviewParticipant) -> list[str]:
+    details = [
+        f"model `{participant.metadata.model or 'default'}`",
+        f"reasoning `{participant.metadata.reasoning_effort or 'default'}`",
+    ]
+    if participant.token_usage:
+        details.append(f"tokens `{participant.token_usage.total_tokens}`")
+    return [f"- {_provider_label(participant.metadata.provider)}: {', '.join(details)}"]
+
+
+def _render_council_sections(participants: tuple[ReviewParticipant, ...]) -> list[str]:
+    review_participants = [participant for participant in participants if "review" in participant.phases]
+    synthesis_participants = [participant for participant in participants if "synthesis" in participant.phases]
+
+    lines: list[str] = []
+    for title, group in (("Review", review_participants), ("Synthesis", synthesis_participants)):
+        if not group:
+            continue
+        lines.extend([f"**{title}**", ""])
+        for participant in group:
+            lines.extend(_render_participant(participant))
+        lines.append("")
+    if lines and lines[-1] == "":
+        return lines[:-1]
+    return lines
+
+
+def _default_review_comparison(result: ReviewResult) -> ReviewComparison:
+    return ReviewComparison(
+        current_findings=tuple(ReviewFindingState(finding=finding, status="new") for finding in result.findings),
+        resolved_findings=(),
+    )
+
+
 def _render_finding_counts(findings) -> str:
     counts = {"high": 0, "medium": 0, "low": 0}
     for finding in findings:
@@ -127,14 +175,30 @@ def _render_finding_counts(findings) -> str:
     return f"Findings: {' '.join(parts)}"
 
 
-def _render_finding_block(index: int, finding) -> list[str]:
+def _render_comparison_counts(comparison: ReviewComparison) -> str:
+    new_count = sum(1 for item in comparison.current_findings if item.status == "new")
+    still_present_count = sum(1 for item in comparison.current_findings if item.status == "still_present")
+    resolved_count = len(comparison.resolved_findings)
+    return f"Changes: `{new_count} new` `{still_present_count} still present` `{resolved_count} resolved`"
+
+
+def _render_finding_block(index: int, finding_state: ReviewFindingState) -> list[str]:
+    finding = finding_state.finding
     lines = [
         f"### {index}. {_severity_label(finding.severity)}: {finding.title}",
         "",
         finding.body,
         "",
         f"Source: `{finding.file}:{finding.line}`",
+        "",
+        f"Status: `{_render_finding_status(finding_state.status)}`",
     ]
+    if finding.sources:
+        lines.extend(["", f"Found by: `{_render_sources(finding.sources)}`"])
+    if getattr(finding, "opinions", None):
+        lines.extend(["", "Council:"])
+        for opinion in finding.opinions:
+            lines.append(f"- `{_provider_label(opinion.provider)}`: {_render_opinion(opinion)}")
     if finding.snippet:
         lines.extend(
             [
@@ -150,9 +214,55 @@ def _render_finding_block(index: int, finding) -> list[str]:
     return lines
 
 
+def _render_resolved_finding(finding) -> str:
+    return f"- {_severity_label(finding.severity)}: {finding.title} at `{finding.file}:{finding.line}`"
+
+
 def _severity_label(severity: str) -> str:
     return {
         "high": "High",
         "medium": "Warning",
         "low": "Low",
     }.get(severity, severity.capitalize())
+
+
+def _render_sources(sources: tuple[str, ...]) -> str:
+    normalized = tuple(sorted(dict.fromkeys(sources)))
+    if normalized == ("claude", "codex"):
+        return "both"
+    return ", ".join(normalized)
+
+
+def _render_finding_status(status: str) -> str:
+    return {
+        "new": "New",
+        "still_present": "Still present",
+    }.get(status, status.replace("_", " ").title())
+
+
+def _provider_label(provider: str) -> str:
+    return {
+        "codex": "Codex",
+        "claude": "Claude",
+    }.get(provider, provider.capitalize())
+
+
+def _render_participant_role(phases: tuple[str, ...]) -> str:
+    phase_set = set(phases)
+    if phase_set == {"synthesis"}:
+        return "final synthesis"
+    if phase_set == {"review"}:
+        return "independent review"
+    return ", ".join(phases) or "review"
+
+
+def _render_opinion(opinion) -> str:
+    verdict = {
+        "found": "found independently",
+        "agree": "supports inclusion",
+        "disagree": "questions inclusion",
+        "uncertain": "is uncertain",
+    }.get(opinion.verdict, opinion.verdict)
+    if opinion.reason:
+        return f"{verdict} - {opinion.reason}"
+    return verdict

@@ -33,12 +33,6 @@ def parse_merge_request_event(payload: dict) -> MergeRequestEvent | None:
     if _became_ready(attributes, payload):
         return _build_event(payload, attributes, action, source_sha)
 
-    if work_in_progress:
-        return None
-
-    if _has_new_commit(attributes, payload, source_sha):
-        return _build_event(payload, attributes, action, source_sha)
-
     return None
 
 
@@ -60,21 +54,6 @@ def _extract_source_sha(attributes: dict) -> str | None:
         or attributes.get("sha")
         or attributes.get("source", {}).get("last_commit", {}).get("id")
     )
-
-
-def _has_new_commit(attributes: dict, payload: dict, source_sha: str) -> bool:
-    oldrev = attributes.get("oldrev")
-    if oldrev and oldrev != source_sha:
-        return True
-
-    previous_commit = (
-        payload.get("changes", {})
-        .get("last_commit", {})
-        .get("previous", {})
-        .get("id")
-    )
-    return bool(previous_commit and previous_commit != source_sha)
-
 
 def _became_ready(attributes: dict, payload: dict) -> bool:
     changes = payload.get("changes") or {}

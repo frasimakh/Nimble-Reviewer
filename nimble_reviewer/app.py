@@ -11,7 +11,7 @@ from fastapi import FastAPI, Header, HTTPException, Request, Response
 from nimble_reviewer.config import Settings
 from nimble_reviewer.gitlab import GitLabClient
 from nimble_reviewer.gitops import RepoManager
-from nimble_reviewer.review_agent import ClaudeRunner, CodexRunner
+from nimble_reviewer.review_agent import ClaudeRunner, CodexRunner, CouncilRunner
 from nimble_reviewer.runtime_state import prepare_claude_state
 from nimble_reviewer.service import ReviewService, ServiceDependencies
 from nimble_reviewer.store import Store
@@ -26,8 +26,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     cfg = settings or Settings.from_env()
     _configure_logging()
     LOGGER.info(
-        "Starting nimble-reviewer with provider=%s sqlite=%s cache_dir=%s trace_dir=%s concurrency=%s timeout_sec=%s",
-        cfg.review_agent_provider,
+        "Starting nimble-reviewer with council=codex+claude synthesis_provider=%s sqlite=%s cache_dir=%s trace_dir=%s concurrency=%s timeout_sec=%s",
+        cfg.council_synthesis_provider,
         cfg.sqlite_path,
         cfg.repo_cache_dir,
         cfg.review_trace_dir,
@@ -144,11 +144,18 @@ def _configure_logging() -> None:
 
 
 def _build_review_agent(settings: Settings):
-    if settings.review_agent_provider == "codex":
-        return CodexRunner(settings.codex_cmd or (), settings.review_timeout_sec)
-    if settings.review_agent_provider == "claude":
-        return ClaudeRunner(settings.claude_cmd or (), settings.review_timeout_sec)
-    raise RuntimeError(f"Unsupported review agent provider: {settings.review_agent_provider}")
+    codex_runner = CodexRunner(settings.codex_cmd, settings.review_timeout_sec)
+    claude_runner = ClaudeRunner(settings.claude_cmd, settings.review_timeout_sec)
+    synthesis_runner = (
+        CodexRunner(settings.council_synthesis_cmd, settings.review_timeout_sec)
+        if settings.council_synthesis_provider == "codex"
+        else ClaudeRunner(settings.council_synthesis_cmd, settings.review_timeout_sec)
+    )
+    return CouncilRunner(
+        codex_runner=codex_runner,
+        claude_runner=claude_runner,
+        synthesizer=synthesis_runner,
+    )
 
 
 def _short_sha(value: str | None) -> str:

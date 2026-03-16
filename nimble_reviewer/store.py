@@ -195,6 +195,19 @@ class Store:
             ).fetchone()
             return self._row_to_mr_state(row) if row else None
 
+    def get_latest_done_run(self, project_id: int, mr_iid: int) -> ReviewRun | None:
+        with closing(self._connect()) as conn:
+            row = conn.execute(
+                """
+                SELECT * FROM review_run
+                WHERE project_id = ? AND mr_iid = ? AND status = 'done'
+                ORDER BY finished_at DESC, id DESC
+                LIMIT 1
+                """,
+                (project_id, mr_iid),
+            ).fetchone()
+            return self._row_to_run(row) if row else None
+
     def update_note_id(self, project_id: int, mr_iid: int, note_id: int) -> None:
         with closing(self._connect()) as conn:
             conn.execute(

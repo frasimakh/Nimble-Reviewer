@@ -32,10 +32,9 @@ class ParseMergeRequestEventTests(unittest.TestCase):
         event = parse_merge_request_event(_payload("open", work_in_progress=True))
         self.assertIsNone(event)
 
-    def test_update_with_new_commit_triggers(self):
+    def test_update_with_new_commit_is_ignored(self):
         event = parse_merge_request_event(_payload("update", oldrev="old456"))
-        self.assertIsNotNone(event)
-        self.assertEqual(event.action, "update")
+        self.assertIsNone(event)
 
     def test_update_without_commit_change_is_ignored(self):
         event = parse_merge_request_event(_payload("update", oldrev="abc123"))

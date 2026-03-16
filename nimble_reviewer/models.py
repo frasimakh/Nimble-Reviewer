@@ -6,6 +6,16 @@ from typing import Literal
 
 Severity = Literal["high", "medium", "low"]
 RunStatus = Literal["queued", "running", "done", "failed", "superseded"]
+ReviewProvider = Literal["codex", "claude"]
+ReviewOpinionVerdict = Literal["found", "agree", "disagree", "uncertain"]
+FindingStatus = Literal["new", "still_present"]
+
+
+@dataclass(frozen=True)
+class ReviewOpinion:
+    provider: ReviewProvider
+    verdict: ReviewOpinionVerdict
+    reason: str | None = None
 
 
 @dataclass(frozen=True)
@@ -16,6 +26,8 @@ class ReviewFinding:
     title: str
     body: str
     suggestion: str | None = None
+    sources: tuple[ReviewProvider, ...] = field(default_factory=tuple)
+    opinions: tuple[ReviewOpinion, ...] = field(default_factory=tuple)
     snippet: str | None = None
     snippet_start_line: int | None = None
     snippet_language: str | None = None
@@ -43,9 +55,16 @@ class ReviewTokenUsage:
 
 @dataclass(frozen=True)
 class ReviewAgentMetadata:
-    provider: str
+    provider: ReviewProvider
     model: str | None = None
     reasoning_effort: str | None = None
+
+
+@dataclass(frozen=True)
+class ReviewParticipant:
+    metadata: ReviewAgentMetadata
+    phases: tuple[str, ...] = field(default_factory=tuple)
+    token_usage: ReviewTokenUsage | None = None
 
 
 @dataclass(frozen=True)
@@ -55,6 +74,19 @@ class ReviewResult:
     findings: tuple[ReviewFinding, ...] = field(default_factory=tuple)
     token_usage: ReviewTokenUsage | None = None
     agent_metadata: ReviewAgentMetadata | None = None
+    participants: tuple[ReviewParticipant, ...] = field(default_factory=tuple)
+
+
+@dataclass(frozen=True)
+class ReviewFindingState:
+    finding: ReviewFinding
+    status: FindingStatus
+
+
+@dataclass(frozen=True)
+class ReviewComparison:
+    current_findings: tuple[ReviewFindingState, ...] = field(default_factory=tuple)
+    resolved_findings: tuple[ReviewFinding, ...] = field(default_factory=tuple)
 
 
 @dataclass(frozen=True)

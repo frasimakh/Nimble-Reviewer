@@ -241,6 +241,82 @@ class ReviewServiceTests(unittest.TestCase):
         self.assertIn("Source: `file.py:3`", gitlab.note.body)
         self.assertIn("Fix: Add a guard before using the value.", gitlab.note.body)
 
+    def test_second_successful_run_marks_still_present_and_resolved_findings(self):
+        workspace = Path(self.tmpdir.name)
+        (workspace / "file.py").write_text("line1\nline2\nline3\nline4\nline5\n", encoding="utf-8")
+        gitlab = FakeGitLabClient()
+
+        self.store.enqueue_run(1, 2, "sha1", None)
+        first_run = self.store.claim_next_run()
+        gitlab.mr_info = MergeRequestInfo(
+            project_id=1,
+            mr_iid=2,
+            title="Title",
+            description="Description",
+            source_branch="feature",
+            target_branch="main",
+            source_sha="sha1",
+            web_url="https://gitlab.example.com/group/project/-/merge_requests/2",
+            repo_http_url="https://gitlab.example.com/group/project.git",
+        )
+        first_service = ReviewService(
+            ServiceDependencies(
+                store=self.store,
+                gitlab=gitlab,
+                repo_manager=FakeRepoManager(workspace),
+                review_agent=FakeReviewAgentRunner(
+                    result=ReviewResult(
+                        summary="Two issues found.",
+                        overall_risk="medium",
+                        findings=(
+                            ReviewFinding("medium", "file.py", 3, "Bug", "Needs fixing"),
+                            ReviewFinding("low", "old.py", 7, "Old issue", "No longer relevant"),
+                        ),
+                    )
+                ),
+                trace_settings=TraceSettings(Path(self.tmpdir.name) / "traces"),
+            )
+        )
+        first_service.process_run(first_run)
+
+        self.store.enqueue_run(1, 2, "sha2", None)
+        second_run = self.store.claim_next_run()
+        gitlab.mr_info = MergeRequestInfo(
+            project_id=1,
+            mr_iid=2,
+            title="Title",
+            description="Description",
+            source_branch="feature",
+            target_branch="main",
+            source_sha="sha2",
+            web_url="https://gitlab.example.com/group/project/-/merge_requests/2",
+            repo_http_url="https://gitlab.example.com/group/project.git",
+        )
+        second_service = ReviewService(
+            ServiceDependencies(
+                store=self.store,
+                gitlab=gitlab,
+                repo_manager=FakeRepoManager(workspace),
+                review_agent=FakeReviewAgentRunner(
+                    result=ReviewResult(
+                        summary="One issue remains and one is new.",
+                        overall_risk="medium",
+                        findings=(
+                            ReviewFinding("medium", "file.py", 3, "Bug", "Needs fixing"),
+                            ReviewFinding("medium", "new.py", 9, "New issue", "Brand new finding"),
+                        ),
+                    )
+                ),
+                trace_settings=TraceSettings(Path(self.tmpdir.name) / "traces"),
+            )
+        )
+        second_service.process_run(second_run)
+
+        self.assertIn("Status: `Still present`", gitlab.note.body)
+        self.assertIn("Status: `New`", gitlab.note.body)
+        self.assertIn("## Resolved since previous review", gitlab.note.body)
+        self.assertIn("- Low: Old issue at `old.py:7`", gitlab.note.body)
+
 
 if __name__ == "__main__":
     unittest.main()

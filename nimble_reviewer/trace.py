@@ -30,3 +30,11 @@ class RunTrace:
             with self.path.open("a", encoding="utf-8") as handle:
                 handle.write(json.dumps(record, ensure_ascii=True, sort_keys=True))
                 handle.write("\n")
+
+    def write_snapshot(self, name: str, payload: Any) -> Path:
+        snapshot_path = self.path.with_name(f"{self.path.stem}.{name}.json")
+        with self._lock:
+            with snapshot_path.open("w", encoding="utf-8") as handle:
+                json.dump(payload, handle, ensure_ascii=False, indent=2, sort_keys=True)
+                handle.write("\n")
+        return snapshot_path
