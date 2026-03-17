@@ -42,16 +42,6 @@ def render_success_note(
         "",
     ]
 
-    if result.participants:
-        lines.extend(["## Council", ""])
-        lines.extend(_render_council_sections(result.participants))
-        lines.append("")
-    else:
-        if result.agent_metadata:
-            lines.extend([_render_agent_metadata(result.agent_metadata), ""])
-        if result.token_usage:
-            lines.extend([_render_token_usage(result.token_usage), ""])
-
     lines.extend(["## Summary", "", f"Overall risk: **{result.overall_risk.upper()}**"])
     if findings:
         lines.append(_render_finding_counts(findings))
@@ -75,6 +65,16 @@ def render_success_note(
         lines.append("")
     else:
         lines.extend(["- No findings resolved since previous review.", ""])
+
+    if result.participants:
+        lines.extend(["## Council", ""])
+        lines.extend(_render_council_sections(result.participants))
+        lines.append("")
+    else:
+        if result.agent_metadata:
+            lines.extend([_render_agent_metadata(result.agent_metadata), ""])
+        if result.token_usage:
+            lines.extend([_render_token_usage(result.token_usage), ""])
 
     return _compose_note(project_id, mr_iid, "", "\n".join(lines).strip())
 
@@ -194,22 +194,14 @@ def _render_finding_block(index: int, finding_state: ReviewFindingState) -> list
         f"Status: `{_render_finding_status(finding_state.status)}`",
     ]
     if finding.sources:
-        lines.extend(["", f"Found by: `{_render_sources(finding.sources)}`"])
-    if getattr(finding, "opinions", None):
-        lines.extend(["", "Council:"])
-        for opinion in finding.opinions:
-            lines.append(f"- `{_provider_label(opinion.provider)}`: {_render_opinion(opinion)}")
-    if finding.snippet:
-        lines.extend(
-            [
-                "",
-                "```" + (finding.snippet_language or ""),
-                finding.snippet,
-                "```",
-            ]
-        )
+        found_by = _render_sources(finding.sources)
+        found_by_line = f"Found by: `{found_by}`"
+        disagreement = _render_disagreement(finding.opinions) if found_by == "both" else None
+        if disagreement:
+            found_by_line += f" ({disagreement})"
+        lines.extend(["", found_by_line])
     if finding.suggestion:
-        lines.extend(["", f"Fix: {finding.suggestion}"])
+        lines.extend(["", "Fix:", finding.suggestion])
     lines.extend(["", "---", ""])
     return lines
 
@@ -254,6 +246,18 @@ def _render_participant_role(phases: tuple[str, ...]) -> str:
     if phase_set == {"review"}:
         return "independent review"
     return ", ".join(phases) or "review"
+
+
+def _render_disagreement(opinions) -> str | None:
+    disagreeing = [o for o in opinions if o.verdict in ("disagree", "uncertain")]
+    if not disagreeing:
+        return None
+    parts = []
+    for o in disagreeing:
+        label = _provider_label(o.provider)
+        verdict = "questions" if o.verdict == "disagree" else "uncertain"
+        parts.append(f"{label} {verdict}")
+    return "; ".join(parts)
 
 
 def _render_opinion(opinion) -> str:
