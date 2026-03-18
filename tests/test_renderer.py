@@ -105,9 +105,7 @@ class RendererTests(unittest.TestCase):
         )
         self.assertIn("Source: `src/app.py:42`", body)
         self.assertIn("Status: `New`", body)
-        self.assertIn("Council:", body)
-        self.assertIn("`Codex`: found independently - Flagged the empty collection access.", body)
-        self.assertIn("`Claude`: supports inclusion - The same path can index an empty list.", body)
+        self.assertNotIn("Council:", body)
         self.assertIn("```python", body)
         self.assertIn("Fix: Guard the collection before indexing.", body)
 
@@ -188,7 +186,7 @@ class RendererTests(unittest.TestCase):
         self.assertIn("- Claude: model `sonnet`, reasoning `high`", body)
         self.assertIn("- Codex: model `gpt-5.4`, reasoning `low`, tokens `5`", body)
         self.assertIn("(Claude + Codex)", body)
-        self.assertIn("`Claude`: found independently - Raised in the base review.", body)
+        self.assertNotIn("`Claude`: found independently", body)
 
     def test_success_note_renders_still_present_and_resolved_sections(self):
         body = render_success_note(

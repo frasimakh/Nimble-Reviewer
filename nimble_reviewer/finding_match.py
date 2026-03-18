@@ -9,6 +9,9 @@ def findings_match(left: ReviewFinding, right: ReviewFinding) -> bool:
     if left.file != right.file:
         return False
 
+    if left.line == right.line:
+        return True
+
     left_title = _normalize_text(left.title)
     right_title = _normalize_text(right.title)
     if left_title and left_title == right_title:
