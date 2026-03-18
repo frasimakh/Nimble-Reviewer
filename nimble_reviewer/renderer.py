@@ -184,45 +184,61 @@ def _render_comparison_counts(comparison: ReviewComparison) -> str:
 
 def _render_finding_block(index: int, finding_state: ReviewFindingState) -> list[str]:
     finding = finding_state.finding
+    tier = _finding_tier(finding)
+    label = _severity_label(finding.severity, finding.sources)
     lines = [
-        f"### {index}. {_severity_label(finding.severity)}: {finding.title}",
+        f"### {index}. {label}: {finding.title}",
         "",
-        finding.body,
-        "",
+    ]
+    if tier in ("standard", "detailed"):
+        if finding.snippet:
+            lang = finding.snippet_language or ""
+            lines.extend([f"```{lang}", finding.snippet, "```", ""])
+        lines.extend([finding.body, ""])
+    lines.extend([
         f"Source: `{finding.file}:{finding.line}`",
         "",
         f"Status: `{_render_finding_status(finding_state.status)}`",
-    ]
-    if finding.sources:
-        found_by = _render_sources(finding.sources)
-        found_by_line = f"Found by: `{found_by}`"
-        disagreement = _render_disagreement(finding.opinions) if found_by == "both" else None
-        if disagreement:
-            found_by_line += f" ({disagreement})"
-        lines.extend(["", found_by_line])
-    if finding.suggestion:
-        lines.extend(["", "Fix:", finding.suggestion])
+    ])
+    if tier in ("standard", "detailed"):
+        if finding.opinions:
+            lines.extend(["", "Council:"])
+            for opinion in finding.opinions:
+                lines.append(f"`{_provider_label(opinion.provider)}`: {_render_opinion(opinion)}")
+        if finding.suggestion:
+            lines.extend(["", f"Fix: {finding.suggestion}"])
     lines.extend(["", "---", ""])
     return lines
 
 
 def _render_resolved_finding(finding) -> str:
-    return f"- {_severity_label(finding.severity)}: {finding.title} at `{finding.file}:{finding.line}`"
+    return f"- {_severity_label(finding.severity, finding.sources)}: {finding.title} at `{finding.file}:{finding.line}`"
 
 
-def _severity_label(severity: str) -> str:
-    return {
-        "high": "High",
-        "medium": "Warning",
-        "low": "Low",
-    }.get(severity, severity.capitalize())
+def _severity_label(severity: str, sources: tuple[str, ...] = ()) -> str:
+    emoji = {"high": "🚨", "medium": "⚠️", "low": "💡"}.get(severity, "")
+    name = {"high": "High", "medium": "Medium", "low": "Low"}.get(severity, severity.capitalize())
+    sources_str = _render_sources_inline(sources)
+    if sources_str:
+        return f"{emoji} {name} ({sources_str})"
+    return f"{emoji} {name}"
 
 
-def _render_sources(sources: tuple[str, ...]) -> str:
+def _render_sources_inline(sources: tuple[str, ...]) -> str:
     normalized = tuple(sorted(dict.fromkeys(sources)))
     if normalized == ("claude", "codex"):
-        return "both"
-    return ", ".join(normalized)
+        return "Claude + Codex"
+    labels = {"claude": "Claude", "codex": "Codex"}
+    return " + ".join(labels.get(s, s.capitalize()) for s in normalized)
+
+
+def _finding_tier(finding) -> str:
+    source_count = len(set(finding.sources))
+    if finding.severity == "low":
+        return "short"
+    if finding.severity == "medium" and source_count < 2:
+        return "standard"
+    return "detailed"
 
 
 def _render_finding_status(status: str) -> str:
@@ -239,27 +255,6 @@ def _provider_label(provider: str) -> str:
     }.get(provider, provider.capitalize())
 
 
-def _render_participant_role(phases: tuple[str, ...]) -> str:
-    phase_set = set(phases)
-    if phase_set == {"synthesis"}:
-        return "final synthesis"
-    if phase_set == {"review"}:
-        return "independent review"
-    return ", ".join(phases) or "review"
-
-
-def _render_disagreement(opinions) -> str | None:
-    disagreeing = [o for o in opinions if o.verdict in ("disagree", "uncertain")]
-    if not disagreeing:
-        return None
-    parts = []
-    for o in disagreeing:
-        label = _provider_label(o.provider)
-        verdict = "questions" if o.verdict == "disagree" else "uncertain"
-        parts.append(f"{label} {verdict}")
-    return "; ".join(parts)
-
-
 def _render_opinion(opinion) -> str:
     verdict = {
         "found": "found independently",
@@ -270,3 +265,14 @@ def _render_opinion(opinion) -> str:
     if opinion.reason:
         return f"{verdict} - {opinion.reason}"
     return verdict
+
+
+def _render_participant_role(phases: tuple[str, ...]) -> str:
+    phase_set = set(phases)
+    if phase_set == {"synthesis"}:
+        return "final synthesis"
+    if phase_set == {"review"}:
+        return "independent review"
+    return ", ".join(phases) or "review"
+
+

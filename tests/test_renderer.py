@@ -32,10 +32,10 @@ class RendererTests(unittest.TestCase):
         self.assertIn("## Summary", body)
         self.assertIn("## Current findings", body)
         self.assertIn("## Resolved since previous review", body)
-        self.assertIn("### 1. High: First", body)
-        self.assertIn("### 2. Warning: Second", body)
+        self.assertIn("### 1. 🚨 High: First", body)
+        self.assertIn("### 2. ⚠️ Medium: Second", body)
         self.assertIn("Status: `New`", body)
-        self.assertLess(body.find("### 1. High: First"), body.find("### 2. Warning: Second"))
+        self.assertLess(body.find("### 1. 🚨 High: First"), body.find("### 2. ⚠️ Medium: Second"))
 
     def test_failure_note_keeps_previous_review(self):
         success = render_success_note(
@@ -107,6 +107,7 @@ class RendererTests(unittest.TestCase):
         self.assertIn("Status: `New`", body)
         self.assertIn("Council:", body)
         self.assertIn("`Codex`: found independently - Flagged the empty collection access.", body)
+        self.assertIn("`Claude`: supports inclusion - The same path can index an empty list.", body)
         self.assertIn("```python", body)
         self.assertIn("Fix: Guard the collection before indexing.", body)
 
@@ -186,7 +187,7 @@ class RendererTests(unittest.TestCase):
         self.assertIn("- Codex: model `gpt-5.4`, reasoning `high`, tokens `13`", body)
         self.assertIn("- Claude: model `sonnet`, reasoning `high`", body)
         self.assertIn("- Codex: model `gpt-5.4`, reasoning `low`, tokens `5`", body)
-        self.assertIn("Found by: `both`", body)
+        self.assertIn("(Claude + Codex)", body)
         self.assertIn("`Claude`: found independently - Raised in the base review.", body)
 
     def test_success_note_renders_still_present_and_resolved_sections(self):
@@ -221,7 +222,7 @@ class RendererTests(unittest.TestCase):
         )
         self.assertIn("Status: `Still present`", body)
         self.assertIn("## Resolved since previous review", body)
-        self.assertIn("- Low: Unused branch at `src/old.py:10`", body)
+        self.assertIn("- 💡 Low: Unused branch at `src/old.py:10`", body)
 
 
 if __name__ == "__main__":

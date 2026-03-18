@@ -315,7 +315,7 @@ class ReviewServiceTests(unittest.TestCase):
         self.assertIn("Status: `Still present`", gitlab.note.body)
         self.assertIn("Status: `New`", gitlab.note.body)
         self.assertIn("## Resolved since previous review", gitlab.note.body)
-        self.assertIn("- Low: Old issue at `old.py:7`", gitlab.note.body)
+        self.assertIn("- 💡 Low: Old issue at `old.py:7`", gitlab.note.body)
 
 
 if __name__ == "__main__":
