@@ -201,10 +201,6 @@ def _render_finding_block(index: int, finding_state: ReviewFindingState) -> list
         f"Status: `{_render_finding_status(finding_state.status)}`",
     ])
     if tier in ("standard", "detailed"):
-        if finding.opinions:
-            lines.extend(["", "Council:"])
-            for opinion in finding.opinions:
-                lines.append(f"`{_provider_label(opinion.provider)}`: {_render_opinion(opinion)}")
         if finding.suggestion:
             lines.extend(["", f"Fix: {finding.suggestion}"])
     lines.extend(["", "---", ""])
