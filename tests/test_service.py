@@ -236,8 +236,8 @@ class ReviewServiceTests(unittest.TestCase):
 
         service.process_run(run)
 
-        self.assertIn("```python", gitlab.note.body)
-        self.assertIn(">>3 | line3", gitlab.note.body)
+        self.assertNotIn("```python", gitlab.note.body)
+        self.assertNotIn(">>3 | line3", gitlab.note.body)
         self.assertIn("Source: `file.py:3`", gitlab.note.body)
         self.assertIn("Fix: Add a guard before using the value.", gitlab.note.body)
 

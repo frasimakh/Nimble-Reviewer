@@ -106,7 +106,7 @@ class RendererTests(unittest.TestCase):
         self.assertIn("Source: `src/app.py:42`", body)
         self.assertIn("Status: `New`", body)
         self.assertNotIn("Council:", body)
-        self.assertIn("```python", body)
+        self.assertNotIn("```python", body)
         self.assertIn("Fix: Guard the collection before indexing.", body)
 
     def test_success_note_includes_claude_cost_and_cache_write(self):

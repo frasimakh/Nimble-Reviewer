@@ -191,9 +191,6 @@ def _render_finding_block(index: int, finding_state: ReviewFindingState) -> list
         "",
     ]
     if tier in ("standard", "detailed"):
-        if finding.snippet:
-            lang = finding.snippet_language or ""
-            lines.extend([f"```{lang}", finding.snippet, "```", ""])
         lines.extend([finding.body, ""])
     lines.extend([
         f"Source: `{finding.file}:{finding.line}`",
