@@ -65,6 +65,7 @@ class ReviewParticipant:
     metadata: ReviewAgentMetadata
     phases: tuple[str, ...] = field(default_factory=tuple)
     token_usage: ReviewTokenUsage | None = None
+    summary: str | None = None
 
 
 @dataclass(frozen=True)

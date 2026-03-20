@@ -197,6 +197,7 @@ class CouncilRunner:
                 phase="synthesis",
                 metadata=self.synthesizer.agent_metadata,
                 token_usage=synthesis_usage,
+                summary=str(synthesis_payload.get("summary", "")).strip() or None,
             )
         )
         final_result = _review_result_from_payload(
@@ -305,6 +306,7 @@ class CouncilRunner:
                         phase="review",
                         metadata=result.agent_metadata or ReviewAgentMetadata(provider=provider),  # type: ignore[arg-type]
                         token_usage=result.token_usage,
+                        summary=result.summary or None,
                     )
                 )
                 results[provider] = (result, provider_runs[-1])
@@ -317,6 +319,7 @@ class _ProviderRun:
     phase: str
     metadata: ReviewAgentMetadata
     token_usage: ReviewTokenUsage | None
+    summary: str | None = None
 
 
 def _review_result_from_payload(
@@ -611,10 +614,12 @@ def _summarize_participants(runs: list[_ProviderRun]) -> tuple[ReviewParticipant
         current = summaries.get(key)
         phases = tuple(dict.fromkeys((*(current.phases if current else ()), run.phase)))
         usage = _merge_token_usage(current.token_usage if current else None, run.token_usage)
+        summary = (current.summary if current else None) or run.summary or None
         summaries[key] = ReviewParticipant(
             metadata=run.metadata,
             phases=phases,
             token_usage=usage,
+            summary=summary,
         )
     return tuple(
         participant

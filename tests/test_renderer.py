@@ -73,7 +73,6 @@ class RendererTests(unittest.TestCase):
         self.assertIn("Agent:", body)
         self.assertIn("gpt-5.4", body)
         self.assertIn("xhigh", body)
-        self.assertIn("Tokens: `total=1280`", body)
         self.assertNotIn("input=", body)
         self.assertNotIn("Review Trace", body)
 
@@ -134,7 +133,6 @@ class RendererTests(unittest.TestCase):
                 ),
             ),
         )
-        self.assertIn("Tokens: `total=1320`", body)
         self.assertNotIn("cache_write=", body)
         self.assertNotIn("cost_usd=", body)
         self.assertNotIn("input=", body)
@@ -179,12 +177,10 @@ class RendererTests(unittest.TestCase):
                 ),
             ),
         )
-        self.assertIn("## Council", body)
-        self.assertIn("**Review**", body)
-        self.assertIn("**Synthesis**", body)
-        self.assertIn("- Codex: model `gpt-5.4`, reasoning `high`, tokens `13`", body)
-        self.assertIn("- Claude: model `sonnet`, reasoning `high`", body)
-        self.assertIn("- Codex: model `gpt-5.4`, reasoning `low`, tokens `5`", body)
+        self.assertNotIn("## Council", body)
+        self.assertIn("**Codex** · `gpt-5.4` · reasoning `high`", body)
+        self.assertIn("**Claude** · `sonnet` · reasoning `high`", body)
+        self.assertIn("**Overall** · `gpt-5.4` · reasoning `low` (synthesis)", body)
         self.assertIn("(Claude + Codex)", body)
         self.assertNotIn("`Claude`: found independently", body)
 

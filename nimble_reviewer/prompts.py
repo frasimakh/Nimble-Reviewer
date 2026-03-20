@@ -138,7 +138,7 @@ Rules:
 - Prefer keeping unique but credible findings from one model instead of dropping them.
 - Your job is synthesis and de-duplication, not suppression.
 - Omit praise and style nits unless they represent a real risk.
-- Keep the final summary concise.
+- Write `summary` as the "Overall verdict" that will be shown directly to developers in the MR comment. Be direct and opinionated: state whether the MR is safe to merge, needs fixes, or has blockers. If concerns are minor or raised by only one model, say so (e.g. "Safe to merge — concerns are minimal and low-confidence"). Do not just list findings; give a clear recommendation.
 
 Original review brief:
 {base_review_prompt}

@@ -42,13 +42,21 @@ def render_success_note(
         "",
     ]
 
-    lines.extend(["## Summary", "", f"Overall risk: **{result.overall_risk.upper()}**"])
-    if findings:
-        lines.append(_render_finding_counts(findings))
+    lines.extend(["## Summary", ""])
+    if result.participants:
+        lines.extend(_render_summary_with_council(result, findings, comparison))
     else:
-        lines.append("No actionable issues found.")
-    lines.append(_render_comparison_counts(comparison))
-    lines.extend(["", result.summary.strip(), ""])
+        lines.extend([
+            f"Overall risk: **{result.overall_risk.upper()}**",
+        ])
+        if findings:
+            lines.append(_render_finding_counts(findings))
+        else:
+            lines.append("No actionable issues found.")
+        lines.append(_render_comparison_counts(comparison))
+        lines.extend(["", result.summary.strip(), ""])
+        if result.agent_metadata:
+            lines.extend([_render_agent_metadata(result.agent_metadata), ""])
 
     if current_findings:
         lines.append("## Current findings")
@@ -65,16 +73,6 @@ def render_success_note(
         lines.append("")
     else:
         lines.extend(["- No findings resolved since previous review.", ""])
-
-    if result.participants:
-        lines.extend(["## Council", ""])
-        lines.extend(_render_council_sections(result.participants))
-        lines.append("")
-    else:
-        if result.agent_metadata:
-            lines.extend([_render_agent_metadata(result.agent_metadata), ""])
-        if result.token_usage:
-            lines.extend([_render_token_usage(result.token_usage), ""])
 
     return _compose_note(project_id, mr_iid, "", "\n".join(lines).strip())
 
@@ -117,11 +115,6 @@ def _compose_note(project_id: int, mr_iid: int, status_block: str, review_block:
     ).strip() + "\n"
 
 
-def _render_token_usage(token_usage) -> str:
-    # Keep the note compact for now. Detailed usage remains in trace files.
-    return f"Tokens: `total={token_usage.total_tokens}`"
-
-
 def _render_agent_metadata(agent_metadata) -> str:
     model = agent_metadata.model or "default"
     reasoning = agent_metadata.reasoning_effort or "default"
@@ -133,31 +126,48 @@ def _render_agent_metadata(agent_metadata) -> str:
     )
 
 
-def _render_participant(participant: ReviewParticipant) -> list[str]:
-    details = [
-        f"model `{participant.metadata.model or 'default'}`",
-        f"reasoning `{participant.metadata.reasoning_effort or 'default'}`",
-    ]
-    if participant.token_usage:
-        details.append(f"tokens `{participant.token_usage.total_tokens}`")
-    return [f"- {_provider_label(participant.metadata.provider)}: {', '.join(details)}"]
-
-
-def _render_council_sections(participants: tuple[ReviewParticipant, ...]) -> list[str]:
-    review_participants = [participant for participant in participants if "review" in participant.phases]
-    synthesis_participants = [participant for participant in participants if "synthesis" in participant.phases]
+def _render_summary_with_council(result: ReviewResult, findings, comparison: ReviewComparison) -> list[str]:
+    review_participants = [p for p in result.participants if "review" in p.phases]
+    synthesis_participants = [p for p in result.participants if "synthesis" in p.phases]
 
     lines: list[str] = []
-    for title, group in (("Review", review_participants), ("Synthesis", synthesis_participants)):
-        if not group:
-            continue
-        lines.extend([f"**{title}**", ""])
-        for participant in group:
-            lines.extend(_render_participant(participant))
-        lines.append("")
-    if lines and lines[-1] == "":
-        return lines[:-1]
+
+    for participant in review_participants:
+        label = _provider_label(participant.metadata.provider)
+        meta = _participant_meta_inline(participant)
+        lines.extend([f"**{label}** · {meta}"])
+        if participant.summary:
+            lines.extend([f"> {participant.summary}", ""])
+        else:
+            lines.append("")
+
+    for participant in synthesis_participants:
+        label = _provider_label(participant.metadata.provider)
+        meta = _participant_meta_inline(participant)
+        lines.extend([f"**Overall** · {meta} (synthesis)"])
+        summary_text = participant.summary or result.summary
+        if summary_text:
+            lines.extend([f"> {summary_text}", ""])
+        else:
+            lines.append("")
+
+    lines.extend([f"Overall risk: **{result.overall_risk.upper()}**"])
+    if findings:
+        lines.append(_render_finding_counts(findings))
+    else:
+        lines.append("No actionable issues found.")
+    lines.extend([_render_comparison_counts(comparison), ""])
+
     return lines
+
+
+def _participant_meta_inline(participant: ReviewParticipant) -> str:
+    parts = []
+    if participant.metadata.model:
+        parts.append(f"`{participant.metadata.model}`")
+    if participant.metadata.reasoning_effort:
+        parts.append(f"reasoning `{participant.metadata.reasoning_effort}`")
+    return " · ".join(parts) if parts else "`default`"
 
 
 def _default_review_comparison(result: ReviewResult) -> ReviewComparison:
@@ -247,25 +257,5 @@ def _provider_label(provider: str) -> str:
         "claude": "Claude",
     }.get(provider, provider.capitalize())
 
-
-def _render_opinion(opinion) -> str:
-    verdict = {
-        "found": "found independently",
-        "agree": "supports inclusion",
-        "disagree": "questions inclusion",
-        "uncertain": "is uncertain",
-    }.get(opinion.verdict, opinion.verdict)
-    if opinion.reason:
-        return f"{verdict} - {opinion.reason}"
-    return verdict
-
-
-def _render_participant_role(phases: tuple[str, ...]) -> str:
-    phase_set = set(phases)
-    if phase_set == {"synthesis"}:
-        return "final synthesis"
-    if phase_set == {"review"}:
-        return "independent review"
-    return ", ".join(phases) or "review"
 
 
