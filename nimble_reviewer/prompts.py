@@ -63,7 +63,7 @@ Rules:
 - Focus on correctness, regressions, security, and maintainability issues that matter before merge.
 - Omit praise and style nits unless they represent a real risk.
 - If there are no actionable issues, return an empty findings array.
-- Keep summary concise.
+- Keep summary concise. Use it to say what this reviewer actually found and how risky it is; do not restate the whole MR.
 - Keep each finding title short and specific.
 - Include `suggestion` only when you have a concrete, short remediation direction.
 - Use repository context when needed, but keep the final output concise and structured.
@@ -102,6 +102,10 @@ Return only strict JSON with this shape:
 {{
   "summary": "short final review summary",
   "overall_risk": "high|medium|low",
+  "reviewer_overview": {{
+    "codex": "short note on what Codex saw",
+    "claude": "short note on what Claude saw"
+  }},
   "findings": [
     {{
       "severity": "high|medium|low",
@@ -138,7 +142,10 @@ Rules:
 - Prefer keeping unique but credible findings from one model instead of dropping them.
 - Your job is synthesis and de-duplication, not suppression.
 - Omit praise and style nits unless they represent a real risk.
-- Write `summary` as the "Overall verdict" that will be shown directly to developers in the MR comment. Be direct and opinionated: state whether the MR is safe to merge, needs fixes, or has blockers. If concerns are minor or raised by only one model, say so (e.g. "Safe to merge — concerns are minimal and low-confidence"). Do not just list findings; give a clear recommendation.
+- Write `summary` as the final council verdict only. It will be shown directly to developers in the MR comment, so be direct and opinionated: state whether the MR is safe to merge, needs fixes, or has blockers. If concerns are minor or raised by only one model, say so (e.g. "Safe to merge — concerns are minimal and low-confidence"). Do not just list findings; give a clear recommendation.
+- Fill `reviewer_overview.codex` and `reviewer_overview.claude` with short reviewer-specific notes describing what each model independently surfaced, emphasized, or agreed with.
+- Do not repeat or paraphrase the full base-review summaries inside `summary`; use `reviewer_overview` for reviewer-specific attribution.
+- Prefer highlighting overlap and unique findings explicitly, e.g. one reviewer confirmed a shared issue while the other added an extra concern.
 
 Original review brief:
 {base_review_prompt}

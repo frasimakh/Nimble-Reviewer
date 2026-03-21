@@ -164,23 +164,29 @@ class RendererTests(unittest.TestCase):
                         metadata=ReviewAgentMetadata(provider="codex", model="gpt-5.4", reasoning_effort="high"),
                         phases=("review",),
                         token_usage=ReviewTokenUsage(input_tokens=10, cached_input_tokens=2, output_tokens=3),
+                        summary="Codex highlighted the shared null-access path.",
+                        overall_risk="medium",
                     ),
                     ReviewParticipant(
                         metadata=ReviewAgentMetadata(provider="codex", model="gpt-5.4", reasoning_effort="low"),
                         phases=("synthesis",),
                         token_usage=ReviewTokenUsage(input_tokens=4, cached_input_tokens=1, output_tokens=1),
+                        summary="Needs fixes before merge: both reviewers agree on one actionable issue.",
+                        overall_risk="medium",
                     ),
                     ReviewParticipant(
                         metadata=ReviewAgentMetadata(provider="claude", model="sonnet", reasoning_effort="high"),
                         phases=("review",),
+                        summary="Claude independently confirmed the same guard issue.",
+                        overall_risk="medium",
                     ),
                 ),
             ),
         )
         self.assertNotIn("## Council", body)
-        self.assertIn("**Codex** · `gpt-5.4` · reasoning `high`", body)
-        self.assertIn("**Claude** · `sonnet` · reasoning `high`", body)
-        self.assertIn("**Overall** · `gpt-5.4` · reasoning `low` (synthesis)", body)
+        self.assertIn("**Codex** · risk **MEDIUM** · `gpt-5.4` · reasoning `high`", body)
+        self.assertIn("**Claude** · risk **MEDIUM** · `sonnet` · reasoning `high`", body)
+        self.assertIn("**Council** · overall risk **MEDIUM** · `gpt-5.4` · reasoning `low` (synthesis)", body)
         self.assertIn("(Claude + Codex)", body)
         self.assertNotIn("`Claude`: found independently", body)
 

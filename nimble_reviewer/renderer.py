@@ -135,23 +135,24 @@ def _render_summary_with_council(result: ReviewResult, findings, comparison: Rev
     for participant in review_participants:
         label = _provider_label(participant.metadata.provider)
         meta = _participant_meta_inline(participant)
-        lines.extend([f"**{label}** · {meta}"])
+        risk = _participant_risk_inline(participant)
+        lines.extend([f"**{label}** · {risk} · {meta}"])
         if participant.summary:
             lines.extend([f"> {participant.summary}", ""])
         else:
             lines.append("")
 
     for participant in synthesis_participants:
-        label = _provider_label(participant.metadata.provider)
         meta = _participant_meta_inline(participant)
-        lines.extend([f"**Overall** · {meta} (synthesis)"])
+        lines.extend([f"**Council** · overall risk **{result.overall_risk.upper()}** · {meta} (synthesis)"])
         summary_text = participant.summary or result.summary
         if summary_text:
             lines.extend([f"> {summary_text}", ""])
         else:
             lines.append("")
 
-    lines.extend([f"Overall risk: **{result.overall_risk.upper()}**"])
+    if not synthesis_participants:
+        lines.extend([f"**Council** · overall risk **{result.overall_risk.upper()}**", f"> {result.summary.strip()}", ""])
     if findings:
         lines.append(_render_finding_counts(findings))
     else:
@@ -168,6 +169,11 @@ def _participant_meta_inline(participant: ReviewParticipant) -> str:
     if participant.metadata.reasoning_effort:
         parts.append(f"reasoning `{participant.metadata.reasoning_effort}`")
     return " · ".join(parts) if parts else "`default`"
+
+
+def _participant_risk_inline(participant: ReviewParticipant) -> str:
+    risk = (participant.overall_risk or "unknown").upper()
+    return f"risk **{risk}**"
 
 
 def _default_review_comparison(result: ReviewResult) -> ReviewComparison:
