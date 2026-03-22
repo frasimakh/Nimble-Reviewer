@@ -146,15 +146,10 @@ def _configure_logging() -> None:
 def _build_review_agent(settings: Settings):
     codex_runner = CodexRunner(settings.codex_cmd, settings.review_timeout_sec)
     claude_runner = ClaudeRunner(settings.claude_cmd, settings.review_timeout_sec)
-    synthesis_runner = (
-        CodexRunner(settings.council_synthesis_cmd, settings.review_timeout_sec)
-        if settings.council_synthesis_provider == "codex"
-        else ClaudeRunner(settings.council_synthesis_cmd, settings.review_timeout_sec)
-    )
     return CouncilRunner(
         codex_runner=codex_runner,
         claude_runner=claude_runner,
-        synthesizer=synthesis_runner,
+        synthesis_provider=settings.council_synthesis_provider,
     )
 
 
