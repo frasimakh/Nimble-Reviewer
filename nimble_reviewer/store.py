@@ -110,31 +110,19 @@ class Store:
             )
             run_id = int(cursor.lastrowid)
 
-            if kind == "full_review":
-                conn.execute(
-                    """
-                    UPDATE review_run
-                    SET status = 'superseded',
-                        superseded_by = ?,
-                        finished_at = COALESCE(finished_at, ?)
-                    WHERE project_id = ? AND mr_iid = ? AND id <> ?
-                      AND status IN ('queued', 'running')
-                    """,
-                    (run_id, now, project_id, mr_iid, run_id),
-                )
-            else:
-                conn.execute(
-                    """
-                    UPDATE review_run
-                    SET status = 'superseded',
-                        superseded_by = ?,
-                        finished_at = COALESCE(finished_at, ?)
-                    WHERE project_id = ? AND mr_iid = ? AND id <> ?
-                      AND kind = 'discussion_reconcile'
-                      AND status IN ('queued', 'running')
-                    """,
-                    (run_id, now, project_id, mr_iid, run_id),
-                )
+            kind_filter = "" if kind == "full_review" else "AND kind = 'discussion_reconcile'"
+            conn.execute(
+                f"""
+                UPDATE review_run
+                SET status = 'superseded',
+                    superseded_by = ?,
+                    finished_at = COALESCE(finished_at, ?)
+                WHERE project_id = ? AND mr_iid = ? AND id <> ?
+                  {kind_filter}
+                  AND status IN ('queued', 'running')
+                """,
+                (run_id, now, project_id, mr_iid, run_id),
+            )
 
             self._upsert_mr_state_row(conn, project_id, mr_iid, source_sha, None, "queued", now)
             conn.commit()

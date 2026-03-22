@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 import logging
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace as dc_replace
 from pathlib import Path
 
 from nimble_reviewer.diff_mapping import DiffMapping, build_diff_mapping
@@ -238,25 +238,12 @@ class ReviewService:
             if decision.reply_body:
                 self.gitlab.add_discussion_note(run.project_id, run.mr_iid, discussion.id, _reply_with_marker(decision.reply_body, tracked.fingerprint))
             if decision.decision == "dismissed_by_discussion":
-                tracked = TrackedFinding(
-                    **{
-                        **tracked.__dict__,
-                        "status": "dismissed_by_discussion",
-                        "dismissed_sha": mr_info.source_sha,
-                        "updated_at": None,
-                    }
-                )
+                tracked = dc_replace(tracked, status="dismissed_by_discussion", dismissed_sha=mr_info.source_sha, updated_at=None)
                 self.store.upsert_tracked_finding(tracked)
                 if tracked.thread_owner == "bot" and not discussion.resolved:
                     self.gitlab.set_discussion_resolved(run.project_id, run.mr_iid, discussion.id, resolved=True)
             elif decision.decision in {"reply_only", "keep_open"}:
-                tracked = TrackedFinding(
-                    **{
-                        **tracked.__dict__,
-                        "last_seen_sha": mr_info.source_sha,
-                        "updated_at": None,
-                    }
-                )
+                tracked = dc_replace(tracked, last_seen_sha=mr_info.source_sha, updated_at=None)
                 self.store.upsert_tracked_finding(tracked)
 
             latest_result = self._load_previous_success_result(run, kind="full_review") or ReviewResult(
@@ -309,6 +296,7 @@ class ReviewService:
 
         for finding_state in comparison.current_findings:
             finding = finding_state.finding
+            fp = finding_fingerprint(finding)
             tracked = _match_tracked_finding(
                 finding,
                 tracked_findings,
@@ -337,7 +325,7 @@ class ReviewService:
                         project_id,
                         mr_iid,
                         human_discussion.id,
-                        _reply_with_marker(_render_thread_reply(finding), finding_fingerprint(finding)),
+                        _reply_with_marker(_render_thread_reply(finding), fp),
                     )
                     discussion_id = human_discussion.id
                     thread_owner = "human"
@@ -345,7 +333,7 @@ class ReviewService:
                     tracked = TrackedFinding(
                         project_id=project_id,
                         mr_iid=mr_iid,
-                        fingerprint=finding_fingerprint(finding),
+                        fingerprint=fp,
                         status="open",
                         severity=finding.severity,
                         file=finding.file,
@@ -367,7 +355,7 @@ class ReviewService:
                         discussion = self.gitlab.create_diff_discussion(
                             project_id,
                             mr_iid,
-                            _render_finding_thread_body(finding, finding_fingerprint(finding)),
+                            _render_finding_thread_body(finding, fp),
                             position,
                         )
                         discussion_id = discussion.id
@@ -376,7 +364,7 @@ class ReviewService:
                         tracked = TrackedFinding(
                             project_id=project_id,
                             mr_iid=mr_iid,
-                            fingerprint=finding_fingerprint(finding),
+                            fingerprint=fp,
                             status="open",
                             severity=finding.severity,
                             file=finding.file,
@@ -396,7 +384,7 @@ class ReviewService:
                         tracked = TrackedFinding(
                             project_id=project_id,
                             mr_iid=mr_iid,
-                            fingerprint=finding_fingerprint(finding),
+                            fingerprint=fp,
                             status="open",
                             severity=finding.severity,
                             file=finding.file,
@@ -412,21 +400,19 @@ class ReviewService:
                         )
                         unplaced_findings.append(finding)
 
-            tracked = TrackedFinding(
-                **{
-                    **tracked.__dict__,
-                    "status": "open",
-                    "severity": finding.severity,
-                    "file": finding.file,
-                    "line": finding.line,
-                    "title": finding.title,
-                    "body": finding.body,
-                    "suggestion": finding.suggestion,
-                    "sources": finding.sources,
-                    "last_seen_sha": source_sha,
-                    "context_snippet": finding.snippet,
-                    "updated_at": None,
-                }
+            tracked = dc_replace(
+                tracked,
+                status="open",
+                severity=finding.severity,
+                file=finding.file,
+                line=finding.line,
+                title=finding.title,
+                body=finding.body,
+                suggestion=finding.suggestion,
+                sources=finding.sources,
+                last_seen_sha=source_sha,
+                context_snippet=finding.snippet,
+                updated_at=None,
             )
             self.store.upsert_tracked_finding(tracked)
             used_tracked.add(tracked.fingerprint)
@@ -451,18 +437,11 @@ class ReviewService:
                 discussion = discussions_by_id.get(tracked.discussion_id)
                 if discussion and not discussion.resolved:
                     self.gitlab.set_discussion_resolved(project_id, mr_iid, tracked.discussion_id, resolved=True)
-            resolved = TrackedFinding(
-                **{
-                    **tracked.__dict__,
-                    "status": "resolved",
-                    "resolved_sha": source_sha,
-                    "updated_at": None,
-                }
-            )
+            resolved = dc_replace(tracked, status="resolved", resolved_sha=source_sha, updated_at=None)
             self.store.upsert_tracked_finding(resolved)
             resolved_count += 1
 
-        dismissed_count = sum(1 for item in self.store.list_tracked_findings(project_id, mr_iid) if item.status == "dismissed_by_discussion")
+        dismissed_count = sum(1 for item in tracked_findings if item.status == "dismissed_by_discussion")
         metrics = ReviewSummaryMetrics(
             open_count=len(current_states),
             new_count=sum(1 for item in current_states if item.status == "new"),
@@ -546,13 +525,18 @@ def _build_discussion_digest(
     linked_discussions = {item.discussion_id for item in tracked_findings if item.discussion_id}
     changed_file_set = set(changed_files)
     blocks: list[str] = []
+    total_chars = 0
     for discussion in discussions:
         file_path = discussion.position.new_path if discussion.position else None
         if not discussion.resolved and (file_path in changed_file_set or discussion.id in linked_discussions):
-            blocks.append(_render_discussion_context(discussion))
+            block = _render_discussion_context(discussion)
+            blocks.append(block)
+            total_chars += len(block)
         elif discussion.id in linked_discussions:
-            blocks.append(_render_discussion_context(discussion))
-        if sum(len(block) for block in blocks) > 10_000:
+            block = _render_discussion_context(discussion)
+            blocks.append(block)
+            total_chars += len(block)
+        if total_chars > 10_000:
             break
     return "\n\n".join(blocks)
 
@@ -798,11 +782,12 @@ def _suppress_dismissed_findings(
     if not dismissed:
         return result
 
+    dismissed_as_findings = [_tracked_finding_to_review_finding(t) for t in dismissed]
     kept_findings: list[ReviewFinding] = []
     for finding in result.findings:
         should_suppress = False
-        for tracked in dismissed:
-            if not findings_match(finding, _tracked_finding_to_review_finding(tracked)):
+        for tracked, dismissed_finding in zip(dismissed, dismissed_as_findings):
+            if not findings_match(finding, dismissed_finding):
                 continue
             if diff_mapping.has_changes_near(tracked.file, tracked.line):
                 break
