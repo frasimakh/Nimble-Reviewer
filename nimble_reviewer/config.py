@@ -15,6 +15,8 @@ class Settings:
     gitlab_webhook_secret: str
     codex_cmd: tuple[str, ...]
     claude_cmd: tuple[str, ...]
+    codex_quota_cmd: tuple[str, ...] | None
+    claude_quota_cmd: tuple[str, ...] | None
     council_synthesis_provider: ReviewProvider
     sqlite_path: Path
     repo_cache_dir: Path
@@ -39,6 +41,8 @@ class Settings:
                 "CLAUDE_CMD",
                 default="claude -p --output-format stream-json --model sonnet --effort high --permission-mode bypassPermissions",
             ),
+            codex_quota_cmd=_read_optional_command("CODEX_QUOTA_CMD"),
+            claude_quota_cmd=_read_optional_command("CLAUDE_QUOTA_CMD"),
             council_synthesis_provider=_read_review_provider("COUNCIL_SYNTHESIS_PROVIDER", default="codex"),
             sqlite_path=Path(_read_required("SQLITE_PATH")),
             repo_cache_dir=Path(_read_required("REPO_CACHE_DIR")),
@@ -72,3 +76,8 @@ def _read_command(env_name: str, default: str | None = None) -> tuple[str, ...]:
     return tuple(shlex.split(value))
 
 
+def _read_optional_command(env_name: str) -> tuple[str, ...] | None:
+    value = os.getenv(env_name, "").strip()
+    if not value:
+        return None
+    return tuple(shlex.split(value))
