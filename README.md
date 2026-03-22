@@ -1,12 +1,16 @@
 # Nimble Reviewer
 
-Containerized GitLab merge request review bot. The service accepts GitLab merge request webhooks, queues persisted review runs in SQLite, checks out the MR, runs Codex and Claude Code reviews in parallel, then lets a final synthesis model produce one bot comment back into the merge request.
+Containerized GitLab merge request review bot. The service accepts GitLab merge request and note webhooks, queues persisted review runs in SQLite, checks out the MR, runs Codex and Claude Code reviews in parallel, then publishes:
 
-Review runs are triggered when a non-draft MR is opened or reopened, and when an existing MR moves from draft to ready. Pushing new commits to an already open MR does not trigger an automatic re-review.
+- one short summary note per MR
+- inline GitLab discussions for findings that can be anchored to the diff
+- lightweight discussion reconciliation when humans reply in MR threads
+
+Full review runs are triggered when a non-draft MR is opened or reopened, and when an existing MR moves from draft to ready. Pushes to an already-open MR still do not trigger an automatic full re-review. Human comments in merge request discussions can trigger a lightweight `discussion_reconcile` run when GitLab `note_events` are enabled.
 
 ## Repository-specific review rules
 
-The reviewer can load repo-local prompt instructions directly from the checked-out repository. On each run it looks for a single file in the repo root:
+The reviewer can load repo-local prompt instructions directly from the checked-out repository. On each full review run it looks for a single file in the repo root:
 
 - `NIMBLE-REVIEWER.MD`
 
@@ -32,24 +36,65 @@ Example `NIMBLE-REVIEWER.MD`:
 
 Repository rules are capped before being injected into the prompt so an oversized rules file does not crowd out the diff.
 
+## Review flows
+
+The service now has two review flows.
+
+### Full review
+
+The full review flow always runs the council:
+
+1. Codex base review
+2. Claude base review
+3. Final synthesis into one merged review result
+
+The synthesized findings are then published as:
+
+- inline discussions when the finding maps to a changed diff line
+- replies in relevant human threads when the concern matches an existing discussion
+- summary-only findings when the finding cannot be anchored safely
+
+The summary note acts as a control panel. It includes:
+
+- reviewed SHA and timestamp
+- council verdict
+- counts for `open`, `new`, `still present`, `resolved`, `dismissed by discussion`, and `unplaced`
+- unplaced findings
+- resolved-in-code findings
+
+It intentionally does not duplicate the full body of inline findings.
+
+### Discussion reconcile
+
+When a human adds or edits a merge request note and `note_events` are enabled in GitLab, the service can enqueue a lightweight `discussion_reconcile` run instead of a full council review.
+
+This reconcile flow:
+
+- loads the touched discussion
+- matches it to an existing tracked finding when possible
+- runs a single-provider decision pass
+- may keep the finding open, reply only, or mark it `dismissed_by_discussion`
+
+Bot-owned threads may be auto-resolved when a human explanation convincingly dismisses the concern. Human-owned threads are reply-only; the bot never resolves them.
+
 ## Required environment
 
 - `GITLAB_URL` should be the base URL of your self-hosted GitLab instance, for example `https://gitlab.example.com`
-- `GITLAB_URL`
 - `GITLAB_TOKEN`
 - `GITLAB_WEBHOOK_SECRET`
 - `CODEX_CMD`
 - `CLAUDE_CMD`
 - `SQLITE_PATH`
 - `REPO_CACHE_DIR`
-- `REVIEW_TIMEOUT_SEC`
-- `MAX_CONCURRENT_REVIEWS`
 
 Optional:
 
 - `COUNCIL_SYNTHESIS_PROVIDER` defaults to `codex`
-- `COUNCIL_SYNTHESIS_CMD` defaults to Codex `gpt-5.4` with `low` reasoning, or Claude `sonnet` with `low` reasoning if the synthesis provider is set to `claude`
+- `DISCUSSION_RECONCILE_PROVIDER` defaults to the same provider as `COUNCIL_SYNTHESIS_PROVIDER`
 - `REVIEW_TRACE_DIR` defaults to `/data/review-traces`
+- `REVIEW_TIMEOUT_SEC` defaults to `600`
+- `MAX_CONCURRENT_REVIEWS` defaults to `1`
+- `POLL_INTERVAL_SEC` defaults to `1.0`
 - `GITLAB_GIT_USERNAME` defaults to `oauth2`
 - `PORT` defaults to `8080` and controls the HTTP port inside the container
 - `HOST_PORT` defaults to `8080` and controls the published port on the host in `docker compose`
@@ -57,19 +102,13 @@ Optional:
 
 ## Review council configuration
 
-The service always runs the same three-step council flow:
-
-1. Codex base review
-2. Claude base review
-3. Final synthesis into one MR note using both base reviews
-
 Default command behavior:
 
 ```env
 CODEX_CMD=codex exec -m gpt-5.4 -c model_reasoning_effort="high" -
 CLAUDE_CMD=claude -p --output-format stream-json --model sonnet --effort high --permission-mode bypassPermissions
 COUNCIL_SYNTHESIS_PROVIDER=codex
-COUNCIL_SYNTHESIS_CMD=codex exec -m gpt-5.4 -c model_reasoning_effort="low" -
+DISCUSSION_RECONCILE_PROVIDER=codex
 ```
 
 For Codex, the command should read the prompt from `stdin` and print the final review JSON to `stdout`.
@@ -79,6 +118,24 @@ For Claude Code, the service supports:
 - plain text mode where Claude prints the final review JSON directly
 - `--output-format json`, where Claude wraps the final review text in a JSON envelope and the service extracts the `result` field
 - `--output-format stream-json`, where the service records Claude provider events into the persisted run trace and extracts the final `result` event
+
+## GitLab webhook setup
+
+The service expects a webhook pointing to:
+
+```text
+http://<host-or-ip>:<port>/webhooks/gitlab
+```
+
+Enable at least:
+
+- Merge request events
+
+Enable this as well if you want live discussion reconciliation:
+
+- Note events
+
+The note webhook path is used only for merge request discussions. Non-MR notes, system notes, and bot-authored notes are ignored.
 
 ## Review trace
 
@@ -104,15 +161,7 @@ For Claude runs, the trace includes:
 - Claude provider events when `CLAUDE_CMD` uses `--output-format stream-json` or `--output-format json`
 - Claude token usage and `total_cost_usd` when the CLI includes usage fields in those events
 
-The MR note stays intentionally short. It includes:
-
-- council participants
-- model and reasoning effort for each participant
-- token usage when available
-- Claude `cost_usd` when available
-- per-finding model attribution: `codex`, `claude`, or `both`
-
-It does not include a separate `Review Trace` section.
+The summary note stays intentionally short. Inline discussion details live in GitLab discussions, not in the trace or the summary note.
 
 ## Local run
 
@@ -193,7 +242,7 @@ docker compose exec nimble-reviewer codex login --device-auth
 docker compose exec nimble-reviewer codex login status
 ```
 
-OpenAI documents both ChatGPT sign-in for the CLI and ChatGPT-managed auth for automation. Treat the persisted auth state as a secret.
+Treat the persisted auth state as a secret.
 
 ### If `codex login` fails with `Permission denied`
 
