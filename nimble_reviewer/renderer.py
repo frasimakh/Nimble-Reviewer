@@ -127,7 +127,7 @@ def _render_summary_with_council(result: ReviewResult) -> list[str]:
     for participant in synthesis_participants:
         meta = _participant_meta_inline(participant)
         lines.extend([f"**Council** · overall risk **{result.overall_risk.upper()}** · {meta} (synthesis)"])
-        summary_text = participant.summary or result.summary
+        summary_text = _synthesis_meta_summary(review_participants, result)
         if summary_text:
             lines.extend([f"> {summary_text}", ""])
         else:
@@ -136,6 +136,23 @@ def _render_summary_with_council(result: ReviewResult) -> list[str]:
     if not synthesis_participants:
         lines.extend([f"**Council** · overall risk **{result.overall_risk.upper()}**", f"> {result.summary.strip()}", ""])
     return lines
+
+
+def _synthesis_meta_summary(review_participants: list[ReviewParticipant], result: ReviewResult) -> str:
+    if not review_participants:
+        return result.summary or ""
+    labels = [_provider_label(p.metadata.provider) for p in review_participants]
+    risks = [p.overall_risk or "unknown" for p in review_participants]
+    all_agree = len(set(r.lower() for r in risks)) == 1
+    reviewer_str = " і ".join(labels)
+    if all_agree:
+        verdict = f"{reviewer_str} незалежно підтвердили ризик **{risks[0].upper()}**"
+    else:
+        risk_parts = ", ".join(f"{l} ({r.upper()})" for l, r in zip(labels, risks))
+        verdict = f"Оцінки розійшлись: {risk_parts}"
+    n = len(result.findings)
+    finding_str = f"{n} {'знахідка' if n == 1 else 'знахідок'}" if n else "знахідок немає"
+    return f"{verdict} — {finding_str}."
 
 
 def _participant_meta_inline(participant: ReviewParticipant) -> str:
