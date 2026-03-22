@@ -331,6 +331,8 @@ def _participants_payload(result) -> list[dict] | None:
                 "reasoning_effort": participant.metadata.reasoning_effort,
                 "phases": list(participant.phases),
                 "token_usage": _token_usage_payload(participant.token_usage),
+                "summary": participant.summary,
+                "overall_risk": participant.overall_risk,
             }
         )
     return payload
@@ -503,6 +505,8 @@ def _participant_from_snapshot_payload(payload: dict) -> ReviewParticipant:
         ),
         phases=tuple(payload.get("phases", ())),
         token_usage=_token_usage_from_snapshot_payload(payload.get("token_usage")),
+        summary=payload.get("summary"),
+        overall_risk=payload.get("overall_risk"),
     )
 
 
