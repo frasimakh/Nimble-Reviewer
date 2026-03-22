@@ -6,6 +6,7 @@ from nimble_reviewer.gitlab import (
     GitLabDiffPosition,
     GitLabDiffVersion,
     GitLabDiscussion,
+    GitLabError,
     GitLabNote,
     GitLabUser,
 )
@@ -32,6 +33,8 @@ class FakeGitLabClient:
         self.summary_note = None
         self.discussions = []
         self.resolved_changes = []
+        self.raise_on_create_diff_discussion = False
+        self.head_sha_override = None
 
     def get_current_user(self):
         return self.current_user
@@ -40,7 +43,7 @@ class FakeGitLabClient:
         return self.mr_info
 
     def get_merge_request_head_sha(self, project_id, mr_iid):
-        return self.mr_info.source_sha
+        return self.head_sha_override or self.mr_info.source_sha
 
     def get_latest_merge_request_version(self, project_id, mr_iid):
         return GitLabDiffVersion(id=1, base_sha="base", start_sha="start", head_sha=self.mr_info.source_sha)
@@ -60,6 +63,8 @@ class FakeGitLabClient:
         return self.summary_note
 
     def create_diff_discussion(self, project_id, mr_iid, body, position):
+        if self.raise_on_create_diff_discussion:
+            raise GitLabError('GitLab API error 500 for POST /projects/1/merge_requests/2/discussions: {"message":"500 Internal Server Error"}')
         note_id = 100 + len(self.discussions) * 10
         discussion = GitLabDiscussion(
             id=f"d{len(self.discussions) + 1}",
@@ -212,6 +217,61 @@ class ReviewServiceTests(unittest.TestCase):
         self.assertEqual(tracked[0].status, "open")
         self.assertEqual(tracked[0].thread_owner, "bot")
         self.assertIn("Open findings: `1`", gitlab.summary_note.body)
+
+    def test_full_review_falls_back_to_summary_when_inline_publish_fails_but_head_is_stable(self):
+        workspace = Path(self.tmpdir.name)
+        (workspace / "file.py").write_text("new line\nsecond line\n", encoding="utf-8")
+        gitlab = FakeGitLabClient()
+        gitlab.raise_on_create_diff_discussion = True
+        service = self._service(
+            gitlab,
+            FakeRepoManager(workspace),
+            FakeReviewAgentRunner(
+                result=ReviewResult(
+                    summary="One issue found.",
+                    overall_risk="medium",
+                    findings=(ReviewFinding("medium", "file.py", 1, "Bug", "Needs fixing"),),
+                )
+            ),
+        )
+
+        self.store.enqueue_run(1, 2, "sha1", None)
+        run = self.store.claim_next_run()
+        service.process_run(run)
+
+        tracked = self.store.list_tracked_findings(1, 2)
+        stored_run = self.store.get_run(run.id)
+        self.assertEqual(stored_run.status, "done")
+        self.assertEqual(len(gitlab.discussions), 0)
+        self.assertEqual(tracked[0].thread_owner, "summary-only")
+        self.assertIn("`1 unplaced`", gitlab.summary_note.body)
+
+    def test_full_review_is_superseded_when_inline_publish_fails_after_head_changes(self):
+        workspace = Path(self.tmpdir.name)
+        (workspace / "file.py").write_text("new line\nsecond line\n", encoding="utf-8")
+        gitlab = FakeGitLabClient()
+        gitlab.raise_on_create_diff_discussion = True
+        gitlab.head_sha_override = "sha2"
+        service = self._service(
+            gitlab,
+            FakeRepoManager(workspace),
+            FakeReviewAgentRunner(
+                result=ReviewResult(
+                    summary="One issue found.",
+                    overall_risk="medium",
+                    findings=(ReviewFinding("medium", "file.py", 1, "Bug", "Needs fixing"),),
+                )
+            ),
+        )
+
+        self.store.enqueue_run(1, 2, "sha1", None)
+        run = self.store.claim_next_run()
+        service.process_run(run)
+
+        stored_run = self.store.get_run(run.id)
+        self.assertEqual(stored_run.status, "superseded")
+        self.assertIsNone(gitlab.summary_note)
+        self.assertEqual(self.store.list_tracked_findings(1, 2), [])
 
     def test_second_full_review_reuses_existing_discussion_and_marks_still_present(self):
         workspace = Path(self.tmpdir.name)

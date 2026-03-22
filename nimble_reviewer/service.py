@@ -8,7 +8,7 @@ from pathlib import Path
 
 from nimble_reviewer.diff_mapping import DiffMapping, build_diff_mapping
 from nimble_reviewer.finding_match import finding_fingerprint, findings_match
-from nimble_reviewer.gitlab import GitLabClient, GitLabDiscussion
+from nimble_reviewer.gitlab import GitLabClient, GitLabDiscussion, GitLabError
 from nimble_reviewer.gitops import RepoManager
 from nimble_reviewer.models import (
     DiscussionReconcileResult,
@@ -59,6 +59,10 @@ class _PublishedReviewState:
     metrics: ReviewSummaryMetrics
     current_states: tuple[ReviewFindingState, ...]
     unplaced_findings: tuple[ReviewFinding, ...]
+
+
+class _StaleRunDuringPublish(RuntimeError):
+    pass
 
 
 class ReviewService:
@@ -146,17 +150,23 @@ class ReviewService:
 
             latest_version = self.gitlab.get_latest_merge_request_version(run.project_id, run.mr_iid)
             current_discussions = self.gitlab.list_merge_request_discussions(run.project_id, run.mr_iid)
-            publication = self._publish_review_findings(
-                project_id=run.project_id,
-                mr_iid=run.mr_iid,
-                source_sha=mr_info.source_sha,
-                result=result,
-                comparison=comparison,
-                tracked_findings=tracked_findings,
-                discussions=current_discussions,
-                diff_mapping=diff_mapping,
-                latest_version=latest_version,
-            )
+            try:
+                publication = self._publish_review_findings(
+                    run_id=run.id,
+                    project_id=run.project_id,
+                    mr_iid=run.mr_iid,
+                    source_sha=mr_info.source_sha,
+                    result=result,
+                    comparison=comparison,
+                    tracked_findings=tracked_findings,
+                    discussions=current_discussions,
+                    diff_mapping=diff_mapping,
+                    latest_version=latest_version,
+                )
+            except _StaleRunDuringPublish:
+                self.store.mark_superseded_if_running(run.id)
+                LOGGER.info("Run %s became stale during inline publish", run.id)
+                return
 
             note = self._upsert_success_note(
                 run.project_id,
@@ -277,6 +287,7 @@ class ReviewService:
     def _publish_review_findings(
         self,
         *,
+        run_id: int,
         project_id: int,
         mr_iid: int,
         source_sha: str,
@@ -351,14 +362,19 @@ class ReviewService:
                     )
                 else:
                     position = diff_mapping.to_position(finding.file, finding.line, latest_version)
+                    created_discussion = None
                     if position is not None:
-                        discussion = self.gitlab.create_diff_discussion(
-                            project_id,
-                            mr_iid,
-                            _render_finding_thread_body(finding, fp),
-                            position,
+                        created_discussion = self._create_inline_discussion_or_none(
+                            run_id=run_id,
+                            project_id=project_id,
+                            mr_iid=mr_iid,
+                            source_sha=source_sha,
+                            finding=finding,
+                            fingerprint=fp,
+                            position=position,
                         )
-                        discussion_id = discussion.id
+                    if created_discussion is not None:
+                        discussion_id = created_discussion.id
                         thread_owner = "bot"
                         placement = "inline"
                         tracked = TrackedFinding(
@@ -373,8 +389,8 @@ class ReviewService:
                             body=finding.body,
                             suggestion=finding.suggestion,
                             sources=finding.sources,
-                            discussion_id=discussion.id,
-                            root_note_id=discussion.root_note.id if discussion.root_note else None,
+                            discussion_id=created_discussion.id,
+                            root_note_id=created_discussion.root_note.id if created_discussion.root_note else None,
                             thread_owner="bot",
                             opened_sha=source_sha,
                             last_seen_sha=source_sha,
@@ -455,6 +471,56 @@ class ReviewService:
             current_states=tuple(current_states),
             unplaced_findings=tuple(unplaced_findings),
         )
+
+    def _create_inline_discussion_or_none(
+        self,
+        *,
+        run_id: int,
+        project_id: int,
+        mr_iid: int,
+        source_sha: str,
+        finding: ReviewFinding,
+        fingerprint: str,
+        position,
+    ) -> GitLabDiscussion | None:
+        try:
+            return self.gitlab.create_diff_discussion(
+                project_id,
+                mr_iid,
+                _render_finding_thread_body(finding, fingerprint),
+                position,
+            )
+        except GitLabError as exc:
+            current_head_sha = self.gitlab.get_merge_request_head_sha(project_id, mr_iid)
+            if current_head_sha != source_sha:
+                LOGGER.warning(
+                    "Inline publish failed for run_id=%s finding=%r at %s:%s because MR head changed from %s to %s",
+                    run_id,
+                    finding.title,
+                    finding.file,
+                    finding.line,
+                    _short_sha(source_sha),
+                    _short_sha(current_head_sha),
+                )
+                raise _StaleRunDuringPublish from exc
+
+            LOGGER.warning(
+                "Inline publish failed for run_id=%s finding=%r at %s:%s; degrading to summary-only. "
+                "position old=%s:%s new=%s:%s diff_refs=%s/%s/%s error=%s",
+                run_id,
+                finding.title,
+                finding.file,
+                finding.line,
+                position.old_path,
+                position.old_line,
+                position.new_path,
+                position.new_line,
+                _short_sha(position.base_sha),
+                _short_sha(position.start_sha),
+                _short_sha(position.head_sha),
+                exc,
+            )
+            return None
 
     def _create_trace(self, run: ReviewRun) -> RunTrace | None:
         path = self.trace_settings.directory / f"run-{run.id}.jsonl"
