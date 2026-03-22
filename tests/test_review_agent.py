@@ -1,7 +1,9 @@
 import json
+import tempfile
 import unittest
+from pathlib import Path
 
-from nimble_reviewer.models import ReviewAgentMetadata, ReviewFinding, ReviewResult, ReviewTokenUsage
+from nimble_reviewer.models import ReviewAgentMetadata, ReviewFinding, ReviewQuotaStatus, ReviewResult, ReviewTokenUsage
 from nimble_reviewer.review_agent import ReviewAgentError
 
 
@@ -194,6 +196,22 @@ class ReviewAgentTests(unittest.TestCase):
         command = _normalize_claude_command(("claude", "-p", "--output-format", "stream-json", "--verbose"))
 
         self.assertEqual(command.count("--verbose"), 1)
+
+    def test_probe_quota_status_reads_remaining_percent_and_reset(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            script = Path(tmpdir) / "quota.py"
+            script.write_text(
+                "import json\n"
+                "print(json.dumps({'remaining_percent': 62.5, 'reset_at': '2026-03-22T18:00:00Z'}))\n",
+                encoding="utf-8",
+            )
+
+            quota_status = _probe_quota_status(("python", str(script)), Path(tmpdir))
+
+        self.assertEqual(
+            quota_status,
+            ReviewQuotaStatus(remaining_percent=62.5, reset_at="2026-03-22T18:00:00Z"),
+        )
 
     def test_council_runner_combines_two_reviews_and_separate_synthesis_profile(self):
         from pathlib import Path
@@ -439,6 +457,12 @@ def _extract_claude_result_from_stream(raw: str) -> dict:
     from nimble_reviewer.review_agent import _extract_claude_result_from_stream, _load_json_object
 
     return _load_json_object(_extract_claude_result_from_stream(raw))
+
+
+def _probe_quota_status(command: tuple[str, ...], cwd: Path):
+    from nimble_reviewer.review_agent import _probe_quota_status
+
+    return _probe_quota_status("codex", command, cwd, None)
 
 
 class _MemoryTrace:

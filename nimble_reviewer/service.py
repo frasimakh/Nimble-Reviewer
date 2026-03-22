@@ -9,7 +9,7 @@ from pathlib import Path
 from nimble_reviewer.finding_match import findings_match
 from nimble_reviewer.gitlab import GitLabClient
 from nimble_reviewer.gitops import RepoManager
-from nimble_reviewer.models import ReviewAgentMetadata, ReviewComparison, ReviewFinding, ReviewFindingState, ReviewOpinion, ReviewParticipant, ReviewResult, ReviewRun, ReviewTokenUsage
+from nimble_reviewer.models import ReviewAgentMetadata, ReviewComparison, ReviewFinding, ReviewFindingState, ReviewOpinion, ReviewParticipant, ReviewQuotaStatus, ReviewResult, ReviewRun, ReviewTokenUsage
 from nimble_reviewer.prompts import build_review_prompt
 from nimble_reviewer.review_agent import ReviewAgentRunner
 from nimble_reviewer.renderer import note_marker, render_failure_note, render_success_note
@@ -331,6 +331,7 @@ def _participants_payload(result) -> list[dict] | None:
                 "reasoning_effort": participant.metadata.reasoning_effort,
                 "phases": list(participant.phases),
                 "token_usage": _token_usage_payload(participant.token_usage),
+                "quota_status": _quota_status_payload(participant.quota_status),
                 "summary": participant.summary,
                 "overall_risk": participant.overall_risk,
             }
@@ -382,6 +383,7 @@ def _enrich_result_for_rendering(result: ReviewResult, checkout_path: Path) -> R
         overall_risk=result.overall_risk,
         findings=enriched,
         token_usage=result.token_usage,
+        quota_status=result.quota_status,
         agent_metadata=result.agent_metadata,
         participants=result.participants,
     )
@@ -393,6 +395,7 @@ def _review_result_snapshot_payload(result: ReviewResult) -> dict:
         "overall_risk": result.overall_risk,
         "findings": [_finding_snapshot_payload(finding) for finding in result.findings],
         "token_usage": _token_usage_snapshot_payload(result.token_usage),
+        "quota_status": _quota_status_payload(result.quota_status),
         "agent_metadata": _agent_metadata_payload(result),
         "participants": _participants_payload(result),
     }
@@ -444,6 +447,7 @@ def _review_result_from_snapshot_payload(payload: dict) -> ReviewResult:
         overall_risk=str(payload.get("overall_risk", "low")),
         findings=findings,
         token_usage=_token_usage_from_snapshot_payload(payload.get("token_usage")),
+        quota_status=_quota_status_from_payload(payload.get("quota_status")),
         agent_metadata=(
             None
             if not agent_metadata
@@ -505,8 +509,28 @@ def _participant_from_snapshot_payload(payload: dict) -> ReviewParticipant:
         ),
         phases=tuple(payload.get("phases", ())),
         token_usage=_token_usage_from_snapshot_payload(payload.get("token_usage")),
+        quota_status=_quota_status_from_payload(payload.get("quota_status")),
         summary=payload.get("summary"),
         overall_risk=payload.get("overall_risk"),
+    )
+
+
+def _quota_status_payload(quota_status: ReviewQuotaStatus | None) -> dict | None:
+    if quota_status is None:
+        return None
+    return {
+        "remaining_percent": quota_status.remaining_percent,
+        "reset_at": quota_status.reset_at,
+    }
+
+
+def _quota_status_from_payload(payload: dict | None) -> ReviewQuotaStatus | None:
+    if not payload:
+        return None
+    remaining_percent = payload.get("remaining_percent")
+    return ReviewQuotaStatus(
+        remaining_percent=None if remaining_percent is None else float(remaining_percent),
+        reset_at=payload.get("reset_at"),
     )
 
 

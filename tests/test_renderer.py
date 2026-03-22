@@ -7,6 +7,7 @@ from nimble_reviewer.models import (
     ReviewFindingState,
     ReviewOpinion,
     ReviewParticipant,
+    ReviewQuotaStatus,
     ReviewResult,
     ReviewTokenUsage,
 )
@@ -164,6 +165,7 @@ class RendererTests(unittest.TestCase):
                         metadata=ReviewAgentMetadata(provider="codex", model="gpt-5.4", reasoning_effort="high"),
                         phases=("review",),
                         token_usage=ReviewTokenUsage(input_tokens=10, cached_input_tokens=2, output_tokens=3),
+                        quota_status=ReviewQuotaStatus(remaining_percent=62.5, reset_at="2026-03-22T18:00:00Z"),
                         summary="Codex highlighted the shared null-access path.",
                         overall_risk="medium",
                     ),
@@ -185,6 +187,8 @@ class RendererTests(unittest.TestCase):
         )
         self.assertNotIn("## Council", body)
         self.assertIn("**Codex** · risk **MEDIUM** · `gpt-5.4` · reasoning `high`", body)
+        self.assertIn("quota `62.5% left`", body)
+        self.assertIn("reset `2026-03-22T18:00:00Z`", body)
         self.assertIn("**Claude** · risk **MEDIUM** · `sonnet` · reasoning `high`", body)
         self.assertIn("**Council** · overall risk **MEDIUM** · `gpt-5.4` · reasoning `low` (synthesis)", body)
         self.assertIn("(Claude + Codex)", body)
