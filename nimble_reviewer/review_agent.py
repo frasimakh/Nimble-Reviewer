@@ -171,6 +171,38 @@ class CouncilRunner:
         provider_runs: list[_ProviderRun] = []
         codex_result, claude_result = self._run_parallel_reviews(prompt, cwd, trace, provider_runs)
 
+        if codex_result is None and claude_result is None:
+            raise ReviewAgentError("Both Codex and Claude reviews failed")
+
+        if codex_result is None or claude_result is None:
+            successful = codex_result if codex_result is not None else claude_result
+            assert successful is not None
+            failed_provider = "codex" if codex_result is None else "claude"
+            successful_provider = "claude" if codex_result is None else "codex"
+            LOGGER.warning(
+                "Council skipping synthesis: %s review failed, using %s result only findings=%s overall_risk=%s",
+                failed_provider,
+                successful_provider,
+                len(successful.findings),
+                successful.overall_risk,
+            )
+            if trace:
+                trace.write(
+                    "council",
+                    "synthesis.skipped",
+                    reason=f"{failed_provider}_review_failed",
+                    fallback_provider=successful_provider,
+                    findings=len(successful.findings),
+                    overall_risk=successful.overall_risk,
+                )
+            participants = _summarize_participants(provider_runs, reviewer_overview=None)
+            return ReviewResult(
+                summary=successful.summary,
+                overall_risk=successful.overall_risk,
+                findings=successful.findings,
+                participants=participants,
+            )
+
         synthesis_prompt = build_council_synthesis_prompt(
             prompt,
             codex_result=codex_result,
@@ -293,8 +325,8 @@ class CouncilRunner:
         cwd: Path,
         trace: RunTrace | None,
         provider_runs: list["_ProviderRun"],
-    ) -> tuple[ReviewResult, ReviewResult]:
-        results: dict[str, tuple[ReviewResult, _ProviderRun]] = {}
+    ) -> tuple[ReviewResult | None, ReviewResult | None]:
+        results: dict[str, ReviewResult] = {}
         with ThreadPoolExecutor(max_workers=2, thread_name_prefix="council-review") as executor:
             future_to_provider = {
                 executor.submit(self._run_review_phase, self.codex_runner, prompt, cwd, trace): "codex",
@@ -302,7 +334,13 @@ class CouncilRunner:
             }
             for future in as_completed(future_to_provider):
                 provider = future_to_provider[future]
-                result = future.result()
+                try:
+                    result = future.result()
+                except Exception as exc:  # noqa: BLE001
+                    LOGGER.warning("Council %s review failed: %s", provider, exc)
+                    if trace:
+                        trace.write("council", "review.failed", provider=provider, error=str(exc))
+                    continue
                 provider_runs.append(
                     _ProviderRun(
                         provider=provider,  # type: ignore[arg-type]
@@ -313,8 +351,8 @@ class CouncilRunner:
                         overall_risk=result.overall_risk,
                     )
                 )
-                results[provider] = (result, provider_runs[-1])
-        return results["codex"][0], results["claude"][0]
+                results[provider] = result
+        return results.get("codex"), results.get("claude")
 
 
 @dataclass(frozen=True)

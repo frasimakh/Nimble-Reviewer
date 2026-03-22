@@ -461,13 +461,17 @@ class _FakeJsonRunner:
         reasoning: str,
         review_result: ReviewResult | None = None,
         json_responses: list[tuple[dict, ReviewTokenUsage | None]] | None = None,
+        review_error: Exception | None = None,
     ):
         self.provider_name = provider
         self.agent_metadata = ReviewAgentMetadata(provider=provider, model=model, reasoning_effort=reasoning)
         self._review_result = review_result
         self._json_responses = list(json_responses or [])
+        self._review_error = review_error
 
     def review(self, prompt, cwd, trace=None):
+        if self._review_error is not None:
+            raise self._review_error
         if self._review_result is None:
             raise AssertionError("Unexpected review() call")
         return self._review_result
@@ -476,6 +480,117 @@ class _FakeJsonRunner:
         if not self._json_responses:
             raise AssertionError("Unexpected run_json() call")
         return self._json_responses.pop(0)
+
+
+class CouncilRunnerFallbackTests(unittest.TestCase):
+    def test_council_runner_falls_back_to_claude_when_codex_fails(self):
+        from pathlib import Path
+
+        from nimble_reviewer.review_agent import CouncilRunner, ReviewAgentError
+
+        codex_runner = _FakeJsonRunner(
+            provider="codex",
+            model="gpt-5.4",
+            reasoning="high",
+            review_error=ReviewAgentError("quota exceeded"),
+        )
+        claude_runner = _FakeJsonRunner(
+            provider="claude",
+            model="sonnet",
+            reasoning="high",
+            review_result=ReviewResult(
+                summary="Claude found one issue.",
+                overall_risk="medium",
+                findings=(ReviewFinding("medium", "app.py", 10, "Null guard", "Need a guard."),),
+            ),
+        )
+        synthesizer = _FakeJsonRunner(provider="codex", model="gpt-5.4", reasoning="low")
+
+        runner = CouncilRunner(codex_runner=codex_runner, claude_runner=claude_runner, synthesizer=synthesizer)
+        result = runner.review("prompt", Path("."))
+
+        self.assertEqual(result.summary, "Claude found one issue.")
+        self.assertEqual(result.overall_risk, "medium")
+        self.assertEqual(len(result.findings), 1)
+        self.assertEqual(len(result.participants), 1)
+        self.assertEqual(result.participants[0].metadata.provider, "claude")
+
+    def test_council_runner_falls_back_to_codex_when_claude_fails(self):
+        from pathlib import Path
+
+        from nimble_reviewer.review_agent import CouncilRunner, ReviewAgentError
+
+        codex_runner = _FakeJsonRunner(
+            provider="codex",
+            model="gpt-5.4",
+            reasoning="high",
+            review_result=ReviewResult(
+                summary="Codex found one issue.",
+                overall_risk="high",
+                findings=(ReviewFinding("high", "db.py", 5, "SQL injection", "Parameterize queries."),),
+            ),
+        )
+        claude_runner = _FakeJsonRunner(
+            provider="claude",
+            model="sonnet",
+            reasoning="high",
+            review_error=ReviewAgentError("rate limit"),
+        )
+        synthesizer = _FakeJsonRunner(provider="codex", model="gpt-5.4", reasoning="low")
+
+        runner = CouncilRunner(codex_runner=codex_runner, claude_runner=claude_runner, synthesizer=synthesizer)
+        result = runner.review("prompt", Path("."))
+
+        self.assertEqual(result.summary, "Codex found one issue.")
+        self.assertEqual(result.overall_risk, "high")
+        self.assertEqual(len(result.findings), 1)
+        self.assertEqual(len(result.participants), 1)
+        self.assertEqual(result.participants[0].metadata.provider, "codex")
+
+    def test_council_runner_raises_when_both_fail(self):
+        from pathlib import Path
+
+        from nimble_reviewer.review_agent import CouncilRunner, ReviewAgentError
+
+        codex_runner = _FakeJsonRunner(
+            provider="codex", model="gpt-5.4", reasoning="high",
+            review_error=ReviewAgentError("quota exceeded"),
+        )
+        claude_runner = _FakeJsonRunner(
+            provider="claude", model="sonnet", reasoning="high",
+            review_error=ReviewAgentError("rate limit"),
+        )
+        synthesizer = _FakeJsonRunner(provider="codex", model="gpt-5.4", reasoning="low")
+
+        runner = CouncilRunner(codex_runner=codex_runner, claude_runner=claude_runner, synthesizer=synthesizer)
+
+        with self.assertRaises(ReviewAgentError):
+            runner.review("prompt", Path("."))
+
+    def test_council_runner_fallback_writes_trace_events(self):
+        from pathlib import Path
+
+        from nimble_reviewer.review_agent import CouncilRunner, ReviewAgentError
+
+        trace = _MemoryTrace()
+        codex_runner = _FakeJsonRunner(
+            provider="codex", model="gpt-5.4", reasoning="high",
+            review_error=ReviewAgentError("quota exceeded"),
+        )
+        claude_runner = _FakeJsonRunner(
+            provider="claude", model="sonnet", reasoning="high",
+            review_result=ReviewResult(summary="ok", overall_risk="low", findings=()),
+        )
+        synthesizer = _FakeJsonRunner(provider="codex", model="gpt-5.4", reasoning="low")
+
+        runner = CouncilRunner(codex_runner=codex_runner, claude_runner=claude_runner, synthesizer=synthesizer)
+        runner.review("prompt", Path("."), trace=trace)
+
+        events = [e["event"] for e in trace.entries]
+        self.assertIn("review.failed", events)
+        self.assertIn("synthesis.skipped", events)
+        failed_event = next(e for e in trace.entries if e["event"] == "review.failed")
+        self.assertEqual(failed_event["provider"], "codex")
 
 
 if __name__ == "__main__":
