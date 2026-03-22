@@ -6,9 +6,14 @@ from typing import Literal
 
 Severity = Literal["high", "medium", "low"]
 RunStatus = Literal["queued", "running", "done", "failed", "superseded"]
+RunKind = Literal["full_review", "discussion_reconcile"]
 ReviewProvider = Literal["codex", "claude"]
 ReviewOpinionVerdict = Literal["found", "agree", "disagree", "uncertain"]
 FindingStatus = Literal["new", "still_present"]
+FindingPlacement = Literal["inline", "summary"]
+TrackedFindingStatus = Literal["open", "resolved", "dismissed_by_discussion"]
+ThreadOwner = Literal["bot", "human", "summary-only"]
+ReconcileDecision = Literal["keep_open", "dismissed_by_discussion", "reply_only", "no_action"]
 
 
 @dataclass(frozen=True)
@@ -83,6 +88,9 @@ class ReviewResult:
 class ReviewFindingState:
     finding: ReviewFinding
     status: FindingStatus
+    placement: FindingPlacement = "inline"
+    discussion_id: str | None = None
+    thread_owner: ThreadOwner | None = None
 
 
 @dataclass(frozen=True)
@@ -109,7 +117,8 @@ class ReviewRun:
     id: int
     project_id: int
     mr_iid: int
-    source_sha: str
+    kind: RunKind
+    source_sha: str | None
     target_sha: str | None
     status: RunStatus
     error: str | None
@@ -117,13 +126,16 @@ class ReviewRun:
     started_at: str | None
     finished_at: str | None
     superseded_by: int | None
+    trigger_discussion_id: str | None
+    trigger_note_id: int | None
+    trigger_author_id: int | None
 
 
 @dataclass(frozen=True)
 class MergeRequestState:
     project_id: int
     mr_iid: int
-    note_id: int | None
+    summary_note_id: int | None
     last_seen_sha: str | None
     last_reviewed_sha: str | None
     status: str
@@ -138,12 +150,57 @@ class EnqueueDecision:
 
 
 @dataclass(frozen=True)
-class MergeRequestEvent:
+class ReviewRequestEvent:
     project_id: int
     mr_iid: int
-    source_sha: str
+    kind: RunKind
+    source_sha: str | None
     target_sha: str | None
     action: str
+    trigger_discussion_id: str | None = None
+    trigger_note_id: int | None = None
+    trigger_author_id: int | None = None
+
+
+@dataclass(frozen=True)
+class TrackedFinding:
+    project_id: int
+    mr_iid: int
+    fingerprint: str
+    status: TrackedFindingStatus
+    severity: Severity
+    file: str
+    line: int
+    title: str
+    body: str
+    suggestion: str | None = None
+    sources: tuple[ReviewProvider, ...] = field(default_factory=tuple)
+    discussion_id: str | None = None
+    root_note_id: int | None = None
+    thread_owner: ThreadOwner = "summary-only"
+    opened_sha: str | None = None
+    last_seen_sha: str | None = None
+    resolved_sha: str | None = None
+    dismissed_sha: str | None = None
+    context_snippet: str | None = None
+    updated_at: str | None = None
+
+
+@dataclass(frozen=True)
+class ReviewSummaryMetrics:
+    open_count: int
+    new_count: int
+    still_present_count: int
+    resolved_count: int
+    dismissed_count: int
+    unplaced_count: int
+
+
+@dataclass(frozen=True)
+class DiscussionReconcileResult:
+    decision: ReconcileDecision
+    reason: str
+    reply_body: str | None = None
 
 
 @dataclass

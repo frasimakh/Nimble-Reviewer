@@ -43,11 +43,12 @@ class WorkerManager:
                 self._stop_event.wait(self.poll_interval_sec)
                 continue
             LOGGER.info(
-                "Worker claimed run_id=%s project=%s mr=%s sha=%s",
+                "Worker claimed run_id=%s kind=%s project=%s mr=%s sha=%s",
                 run.id,
+                run.kind,
                 run.project_id,
                 run.mr_iid,
-                run.source_sha[:12],
+                (run.source_sha or "-")[:12],
             )
             try:
                 self.service.process_run(run)

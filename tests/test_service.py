@@ -2,8 +2,14 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from nimble_reviewer.gitlab import GitLabNote
-from nimble_reviewer.models import MergeRequestInfo, PreparedCheckout, ReviewFinding, ReviewResult
+from nimble_reviewer.gitlab import (
+    GitLabDiffPosition,
+    GitLabDiffVersion,
+    GitLabDiscussion,
+    GitLabNote,
+    GitLabUser,
+)
+from nimble_reviewer.models import MergeRequestInfo, PreparedCheckout, ReviewFinding, ReviewResult, TrackedFinding
 from nimble_reviewer.service import ReviewService, ServiceDependencies
 from nimble_reviewer.store import Store
 from nimble_reviewer.trace import TraceSettings
@@ -11,6 +17,7 @@ from nimble_reviewer.trace import TraceSettings
 
 class FakeGitLabClient:
     def __init__(self):
+        self.current_user = GitLabUser(id=900, username="nimble-reviewer")
         self.mr_info = MergeRequestInfo(
             project_id=1,
             mr_iid=2,
@@ -18,11 +25,16 @@ class FakeGitLabClient:
             description="Description",
             source_branch="feature",
             target_branch="main",
-            source_sha="sha2",
+            source_sha="sha1",
             web_url="https://gitlab.example.com/group/project/-/merge_requests/2",
             repo_http_url="https://gitlab.example.com/group/project.git",
         )
-        self.note = None
+        self.summary_note = None
+        self.discussions = []
+        self.resolved_changes = []
+
+    def get_current_user(self):
+        return self.current_user
 
     def get_merge_request_info(self, project_id, mr_iid):
         return self.mr_info
@@ -30,30 +42,92 @@ class FakeGitLabClient:
     def get_merge_request_head_sha(self, project_id, mr_iid):
         return self.mr_info.source_sha
 
+    def get_latest_merge_request_version(self, project_id, mr_iid):
+        return GitLabDiffVersion(id=1, base_sha="base", start_sha="start", head_sha=self.mr_info.source_sha)
+
+    def list_merge_request_discussions(self, project_id, mr_iid):
+        return list(self.discussions)
+
     def find_bot_note(self, project_id, mr_iid, marker, preferred_note_id=None):
-        return self.note
+        return self.summary_note
 
     def create_note(self, project_id, mr_iid, body):
-        self.note = GitLabNote(id=99, body=body)
-        return self.note
+        self.summary_note = GitLabNote(id=99, body=body, author_id=self.current_user.id)
+        return self.summary_note
 
     def update_note(self, project_id, mr_iid, note_id, body):
-        self.note = GitLabNote(id=note_id, body=body)
-        return self.note
+        self.summary_note = GitLabNote(id=note_id, body=body, author_id=self.current_user.id)
+        return self.summary_note
+
+    def create_diff_discussion(self, project_id, mr_iid, body, position):
+        note_id = 100 + len(self.discussions) * 10
+        discussion = GitLabDiscussion(
+            id=f"d{len(self.discussions) + 1}",
+            individual_note=False,
+            notes=(GitLabNote(id=note_id, body=body, author_id=self.current_user.id),),
+            resolved=False,
+            resolvable=True,
+            position=position,
+        )
+        self.discussions.append(discussion)
+        return discussion
+
+    def add_discussion_note(self, project_id, mr_iid, discussion_id, body):
+        note_id = 1000 + sum(len(d.notes) for d in self.discussions)
+        note = GitLabNote(id=note_id, body=body, author_id=self.current_user.id)
+        for index, discussion in enumerate(self.discussions):
+            if discussion.id != discussion_id:
+                continue
+            self.discussions[index] = GitLabDiscussion(
+                id=discussion.id,
+                individual_note=discussion.individual_note,
+                notes=tuple([*discussion.notes, note]),
+                resolved=discussion.resolved,
+                resolvable=discussion.resolvable,
+                position=discussion.position,
+            )
+            return note
+        raise AssertionError(f"Unknown discussion {discussion_id}")
+
+    def set_discussion_resolved(self, project_id, mr_iid, discussion_id, *, resolved):
+        for index, discussion in enumerate(self.discussions):
+            if discussion.id != discussion_id:
+                continue
+            updated = GitLabDiscussion(
+                id=discussion.id,
+                individual_note=discussion.individual_note,
+                notes=discussion.notes,
+                resolved=resolved,
+                resolvable=discussion.resolvable,
+                position=discussion.position,
+            )
+            self.discussions[index] = updated
+            self.resolved_changes.append((discussion_id, resolved))
+            return updated
+        raise AssertionError(f"Unknown discussion {discussion_id}")
 
 
 class FakeRepoManager:
-    def __init__(self, workspace: Path, review_rules_path=None, review_rules_text=None):
+    def __init__(self, workspace: Path, diff_text: str | None = None, changed_files=None, review_rules_path=None, review_rules_text=None):
         self.workspace = workspace
         self.review_rules_path = review_rules_path
         self.review_rules_text = review_rules_text
+        self.diff_text = diff_text or (
+            "diff --git a/file.py b/file.py\n"
+            "--- a/file.py\n"
+            "+++ b/file.py\n"
+            "@@ -0,0 +1,2 @@\n"
+            "+new line\n"
+            "+second line\n"
+        )
+        self.changed_files = changed_files or ["file.py"]
 
     def prepare_checkout(self, repo_http_url, source_sha, target_branch, trace=None):
         return PreparedCheckout(
             path=self.workspace,
             merge_base="base123",
-            diff_text="diff --git a/file.py b/file.py\n+new line",
-            changed_files=["file.py"],
+            diff_text=self.diff_text,
+            changed_files=self.changed_files,
             review_rules_path=self.review_rules_path,
             review_rules_text=self.review_rules_text,
             cleanup=lambda: None,
@@ -61,7 +135,7 @@ class FakeRepoManager:
 
 
 class FakeReviewAgentRunner:
-    provider_name = "fake"
+    provider_name = "fake-council"
 
     def __init__(self, result=None, error=None):
         self.result = result
@@ -75,6 +149,19 @@ class FakeReviewAgentRunner:
         return self.result
 
 
+class FakeDiscussionReconcileAgent:
+    provider_name = "codex"
+
+    def __init__(self, payload=None):
+        self.payload = payload or {"decision": "no_action", "reason": "No action."}
+        self.last_prompt = None
+        self.agent_metadata = None
+
+    def run_json(self, prompt, cwd, trace=None):
+        self.last_prompt = prompt
+        return self.payload, None
+
+
 class ReviewServiceTests(unittest.TestCase):
     def setUp(self):
         self.tmpdir = tempfile.TemporaryDirectory()
@@ -84,203 +171,68 @@ class ReviewServiceTests(unittest.TestCase):
     def tearDown(self):
         self.tmpdir.cleanup()
 
-    def test_successful_run_marks_done_and_updates_note(self):
-        decision = self.store.enqueue_run(1, 2, "sha2", None)
-        run = self.store.claim_next_run()
-        gitlab = FakeGitLabClient()
-        service = ReviewService(
+    def _service(self, gitlab, repo_manager, review_agent, reconcile_agent=None):
+        return ReviewService(
             ServiceDependencies(
                 store=self.store,
                 gitlab=gitlab,
-                repo_manager=FakeRepoManager(Path(self.tmpdir.name)),
-                review_agent=FakeReviewAgentRunner(
-                    result=ReviewResult(
-                        summary="One issue found.",
-                        overall_risk="medium",
-                        findings=(ReviewFinding("medium", "file.py", 10, "Bug", "Needs fixing"),),
-                    )
-                ),
+                repo_manager=repo_manager,
+                review_agent=review_agent,
+                discussion_reconcile_agent=reconcile_agent or FakeDiscussionReconcileAgent(),
                 trace_settings=TraceSettings(Path(self.tmpdir.name) / "traces"),
             )
         )
 
+    def test_full_review_creates_summary_note_and_inline_discussion(self):
+        workspace = Path(self.tmpdir.name)
+        (workspace / "file.py").write_text("new line\nsecond line\n", encoding="utf-8")
+        gitlab = FakeGitLabClient()
+        service = self._service(
+            gitlab,
+            FakeRepoManager(workspace),
+            FakeReviewAgentRunner(
+                result=ReviewResult(
+                    summary="One issue found.",
+                    overall_risk="medium",
+                    findings=(ReviewFinding("medium", "file.py", 1, "Bug", "Needs fixing"),),
+                )
+            ),
+        )
+
+        decision = self.store.enqueue_run(1, 2, "sha1", None)
+        run = self.store.claim_next_run()
         service.process_run(run)
 
         state = self.store.get_merge_request_state(1, 2)
-        stored_run = self.store.get_run(decision.run_id)
-        self.assertEqual(stored_run.status, "done")
-        self.assertEqual(state.note_id, 99)
-        self.assertEqual(state.last_reviewed_sha, "sha2")
-        self.assertIn("One issue found.", gitlab.note.body)
+        tracked = self.store.list_tracked_findings(1, 2)
+        self.assertEqual(decision.run_id, run.id)
+        self.assertEqual(state.summary_note_id, 99)
+        self.assertEqual(len(gitlab.discussions), 1)
+        self.assertEqual(len(tracked), 1)
+        self.assertEqual(tracked[0].status, "open")
+        self.assertEqual(tracked[0].thread_owner, "bot")
+        self.assertIn("Open findings: `1`", gitlab.summary_note.body)
 
-    def test_stale_run_is_not_posted(self):
-        self.store.enqueue_run(1, 2, "sha1", None)
-        run = self.store.claim_next_run()
-        gitlab = FakeGitLabClient()
-        service = ReviewService(
-            ServiceDependencies(
-                store=self.store,
-                gitlab=gitlab,
-                repo_manager=FakeRepoManager(Path(self.tmpdir.name)),
-                review_agent=FakeReviewAgentRunner(
-                    result=ReviewResult(summary="unused", overall_risk="low", findings=())
-                ),
-                trace_settings=TraceSettings(Path(self.tmpdir.name) / "traces"),
-            )
-        )
-        service.process_run(run)
-        stored_run = self.store.get_run(run.id)
-        self.assertEqual(stored_run.status, "superseded")
-        self.assertIsNone(gitlab.note)
-
-    def test_failed_run_preserves_existing_review_body(self):
-        self.store.enqueue_run(1, 2, "sha2", None)
-        first_run = self.store.claim_next_run()
-        gitlab = FakeGitLabClient()
-        success_service = ReviewService(
-            ServiceDependencies(
-                store=self.store,
-                gitlab=gitlab,
-                repo_manager=FakeRepoManager(Path(self.tmpdir.name)),
-                review_agent=FakeReviewAgentRunner(
-                    result=ReviewResult(summary="Stable", overall_risk="low", findings=())
-                ),
-                trace_settings=TraceSettings(Path(self.tmpdir.name) / "traces"),
-            )
-        )
-        success_service.process_run(first_run)
-
-        self.store.enqueue_run(1, 2, "sha2b", None)
-        second_run = self.store.claim_next_run()
-        gitlab.mr_info = MergeRequestInfo(
-            project_id=1,
-            mr_iid=2,
-            title="Title",
-            description="Description",
-            source_branch="feature",
-            target_branch="main",
-            source_sha="sha2b",
-            web_url=gitlab.mr_info.web_url,
-            repo_http_url=gitlab.mr_info.repo_http_url,
-        )
-        failed_service = ReviewService(
-            ServiceDependencies(
-                store=self.store,
-                gitlab=gitlab,
-                repo_manager=FakeRepoManager(Path(self.tmpdir.name)),
-                review_agent=FakeReviewAgentRunner(error="timeout"),
-                trace_settings=TraceSettings(Path(self.tmpdir.name) / "traces"),
-            )
-        )
-        failed_service.process_run(second_run)
-
-        self.assertIn("Stable", gitlab.note.body)
-        self.assertIn("failed", gitlab.note.body.lower())
-
-    def test_repo_specific_rules_are_added_to_prompt(self):
-        self.store.enqueue_run(1, 2, "sha2", None)
-        run = self.store.claim_next_run()
-        gitlab = FakeGitLabClient()
-        review_agent = FakeReviewAgentRunner(result=ReviewResult(summary="ok", overall_risk="low", findings=()))
-        service = ReviewService(
-            ServiceDependencies(
-                store=self.store,
-                gitlab=gitlab,
-                repo_manager=FakeRepoManager(
-                    Path(self.tmpdir.name),
-                    review_rules_path="NIMBLE-REVIEWER.MD",
-                    review_rules_text="- Treat auth bypasses as high severity.",
-                ),
-                review_agent=review_agent,
-                trace_settings=TraceSettings(Path(self.tmpdir.name) / "traces"),
-            )
-        )
-
-        service.process_run(run)
-
-        self.assertIsNotNone(review_agent.last_prompt)
-        self.assertIn("Repository-specific review rules", review_agent.last_prompt)
-        self.assertIn("NIMBLE-REVIEWER.MD", review_agent.last_prompt)
-        self.assertIn("Treat auth bypasses as high severity.", review_agent.last_prompt)
-
-    def test_success_note_includes_snippet_from_checkout(self):
+    def test_second_full_review_reuses_existing_discussion_and_marks_still_present(self):
         workspace = Path(self.tmpdir.name)
-        (workspace / "file.py").write_text("line1\nline2\nline3\nline4\nline5\n", encoding="utf-8")
-        self.store.enqueue_run(1, 2, "sha2", None)
-        run = self.store.claim_next_run()
+        (workspace / "file.py").write_text("new line\nsecond line\n", encoding="utf-8")
         gitlab = FakeGitLabClient()
-        service = ReviewService(
-            ServiceDependencies(
-                store=self.store,
-                gitlab=gitlab,
-                repo_manager=FakeRepoManager(workspace),
-                review_agent=FakeReviewAgentRunner(
-                    result=ReviewResult(
-                        summary="One issue found.",
-                        overall_risk="medium",
-                        findings=(
-                            ReviewFinding(
-                                "medium",
-                                "file.py",
-                                3,
-                                "Bug",
-                                "Needs fixing",
-                                suggestion="Add a guard before using the value.",
-                            ),
-                        ),
-                    )
-                ),
-                trace_settings=TraceSettings(Path(self.tmpdir.name) / "traces"),
-            )
+        first_service = self._service(
+            gitlab,
+            FakeRepoManager(workspace),
+            FakeReviewAgentRunner(
+                result=ReviewResult(
+                    summary="One issue found.",
+                    overall_risk="medium",
+                    findings=(ReviewFinding("medium", "file.py", 1, "Bug", "Needs fixing"),),
+                )
+            ),
         )
-
-        service.process_run(run)
-
-        self.assertNotIn("```python", gitlab.note.body)
-        self.assertNotIn(">>3 | line3", gitlab.note.body)
-        self.assertIn("Source: `file.py:3`", gitlab.note.body)
-        self.assertIn("Fix: Add a guard before using the value.", gitlab.note.body)
-
-    def test_second_successful_run_marks_still_present_and_resolved_findings(self):
-        workspace = Path(self.tmpdir.name)
-        (workspace / "file.py").write_text("line1\nline2\nline3\nline4\nline5\n", encoding="utf-8")
-        gitlab = FakeGitLabClient()
 
         self.store.enqueue_run(1, 2, "sha1", None)
         first_run = self.store.claim_next_run()
-        gitlab.mr_info = MergeRequestInfo(
-            project_id=1,
-            mr_iid=2,
-            title="Title",
-            description="Description",
-            source_branch="feature",
-            target_branch="main",
-            source_sha="sha1",
-            web_url="https://gitlab.example.com/group/project/-/merge_requests/2",
-            repo_http_url="https://gitlab.example.com/group/project.git",
-        )
-        first_service = ReviewService(
-            ServiceDependencies(
-                store=self.store,
-                gitlab=gitlab,
-                repo_manager=FakeRepoManager(workspace),
-                review_agent=FakeReviewAgentRunner(
-                    result=ReviewResult(
-                        summary="Two issues found.",
-                        overall_risk="medium",
-                        findings=(
-                            ReviewFinding("medium", "file.py", 3, "Bug", "Needs fixing"),
-                            ReviewFinding("low", "old.py", 7, "Old issue", "No longer relevant"),
-                        ),
-                    )
-                ),
-                trace_settings=TraceSettings(Path(self.tmpdir.name) / "traces"),
-            )
-        )
         first_service.process_run(first_run)
 
-        self.store.enqueue_run(1, 2, "sha2", None)
-        second_run = self.store.claim_next_run()
         gitlab.mr_info = MergeRequestInfo(
             project_id=1,
             mr_iid=2,
@@ -289,33 +241,199 @@ class ReviewServiceTests(unittest.TestCase):
             source_branch="feature",
             target_branch="main",
             source_sha="sha2",
-            web_url="https://gitlab.example.com/group/project/-/merge_requests/2",
-            repo_http_url="https://gitlab.example.com/group/project.git",
+            web_url=gitlab.mr_info.web_url,
+            repo_http_url=gitlab.mr_info.repo_http_url,
         )
-        second_service = ReviewService(
-            ServiceDependencies(
-                store=self.store,
-                gitlab=gitlab,
-                repo_manager=FakeRepoManager(workspace),
-                review_agent=FakeReviewAgentRunner(
-                    result=ReviewResult(
-                        summary="One issue remains and one is new.",
-                        overall_risk="medium",
-                        findings=(
-                            ReviewFinding("medium", "file.py", 3, "Bug", "Needs fixing"),
-                            ReviewFinding("medium", "new.py", 9, "New issue", "Brand new finding"),
-                        ),
-                    )
-                ),
-                trace_settings=TraceSettings(Path(self.tmpdir.name) / "traces"),
-            )
+        second_service = self._service(
+            gitlab,
+            FakeRepoManager(workspace),
+            FakeReviewAgentRunner(
+                result=ReviewResult(
+                    summary="Same issue remains.",
+                    overall_risk="medium",
+                    findings=(ReviewFinding("medium", "file.py", 1, "Bug", "Needs fixing"),),
+                )
+            ),
         )
+
+        self.store.enqueue_run(1, 2, "sha2", None)
+        second_run = self.store.claim_next_run()
         second_service.process_run(second_run)
 
-        self.assertIn("Status: `Still present`", gitlab.note.body)
-        self.assertIn("Status: `New`", gitlab.note.body)
-        self.assertIn("## Resolved since previous review", gitlab.note.body)
-        self.assertIn("- 💡 Low: Old issue at `old.py:7`", gitlab.note.body)
+        self.assertEqual(len(gitlab.discussions), 1)
+        self.assertIn("`0 new`", gitlab.summary_note.body)
+        self.assertIn("`1 still present`", gitlab.summary_note.body)
+
+    def test_full_review_resolves_bot_owned_discussion_when_finding_disappears(self):
+        workspace = Path(self.tmpdir.name)
+        (workspace / "file.py").write_text("new line\nsecond line\n", encoding="utf-8")
+        gitlab = FakeGitLabClient()
+        first_service = self._service(
+            gitlab,
+            FakeRepoManager(workspace),
+            FakeReviewAgentRunner(
+                result=ReviewResult(
+                    summary="One issue found.",
+                    overall_risk="medium",
+                    findings=(ReviewFinding("medium", "file.py", 1, "Bug", "Needs fixing"),),
+                )
+            ),
+        )
+        self.store.enqueue_run(1, 2, "sha1", None)
+        first_run = self.store.claim_next_run()
+        first_service.process_run(first_run)
+
+        gitlab.mr_info = MergeRequestInfo(
+            project_id=1,
+            mr_iid=2,
+            title="Title",
+            description="Description",
+            source_branch="feature",
+            target_branch="main",
+            source_sha="sha2",
+            web_url=gitlab.mr_info.web_url,
+            repo_http_url=gitlab.mr_info.repo_http_url,
+        )
+        second_service = self._service(
+            gitlab,
+            FakeRepoManager(workspace),
+            FakeReviewAgentRunner(result=ReviewResult(summary="Looks clear.", overall_risk="low", findings=())),
+        )
+        self.store.enqueue_run(1, 2, "sha2", None)
+        second_run = self.store.claim_next_run()
+        second_service.process_run(second_run)
+
+        tracked = self.store.list_tracked_findings(1, 2)
+        self.assertEqual(tracked[0].status, "resolved")
+        self.assertEqual(gitlab.resolved_changes, [("d1", True)])
+        self.assertIn("`1 resolved`", gitlab.summary_note.body)
+
+    def test_discussion_reconcile_dismisses_bot_thread_and_resolves_it(self):
+        workspace = Path(self.tmpdir.name)
+        (workspace / "file.py").write_text("new line\nsecond line\n", encoding="utf-8")
+        gitlab = FakeGitLabClient()
+        full_service = self._service(
+            gitlab,
+            FakeRepoManager(workspace),
+            FakeReviewAgentRunner(
+                result=ReviewResult(
+                    summary="One issue found.",
+                    overall_risk="medium",
+                    findings=(ReviewFinding("medium", "file.py", 1, "Bug", "Needs fixing"),),
+                )
+            ),
+        )
+        self.store.enqueue_run(1, 2, "sha1", None)
+        full_run = self.store.claim_next_run()
+        full_service.process_run(full_run)
+
+        human_reply = GitLabNote(id=501, body="This is safe because we guard it upstream.", author_id=123)
+        discussion = gitlab.discussions[0]
+        gitlab.discussions[0] = GitLabDiscussion(
+            id=discussion.id,
+            individual_note=discussion.individual_note,
+            notes=tuple([*discussion.notes, human_reply]),
+            resolved=False,
+            resolvable=True,
+            position=discussion.position,
+        )
+
+        reconcile_service = self._service(
+            gitlab,
+            FakeRepoManager(workspace),
+            FakeReviewAgentRunner(result=ReviewResult(summary="unused", overall_risk="low", findings=())),
+            reconcile_agent=FakeDiscussionReconcileAgent(
+                payload={
+                    "decision": "dismissed_by_discussion",
+                    "reason": "The human explanation removes the risk.",
+                    "reply_body": "Makes sense. Marking this as dismissed-by-discussion.",
+                }
+            ),
+        )
+        self.store.enqueue_run(
+            1,
+            2,
+            "sha1",
+            None,
+            kind="discussion_reconcile",
+            trigger_discussion_id=discussion.id,
+            trigger_note_id=human_reply.id,
+            trigger_author_id=human_reply.author_id,
+        )
+        reconcile_run = self.store.claim_next_run()
+        reconcile_service.process_run(reconcile_run)
+
+        tracked = self.store.list_tracked_findings(1, 2)
+        self.assertEqual(tracked[0].status, "dismissed_by_discussion")
+        self.assertTrue(gitlab.discussions[0].resolved)
+        self.assertIn("dismissed-by-discussion", gitlab.discussions[0].notes[-1].body)
+        self.assertIn("`1 dismissed by discussion`", gitlab.summary_note.body)
+
+    def test_discussion_reconcile_replies_in_human_thread_without_resolving(self):
+        gitlab = FakeGitLabClient()
+        discussion = GitLabDiscussion(
+            id="human-1",
+            individual_note=False,
+            notes=(GitLabNote(id=700, body="I think this path can still break.", author_id=123),),
+            resolved=False,
+            resolvable=True,
+            position=GitLabDiffPosition(
+                base_sha="base",
+                start_sha="start",
+                head_sha="sha1",
+                old_path="file.py",
+                new_path="file.py",
+                new_line=1,
+            ),
+        )
+        gitlab.discussions.append(discussion)
+        tracked = TrackedFinding(
+            project_id=1,
+            mr_iid=2,
+            fingerprint="fp1",
+            status="open",
+            severity="medium",
+            file="file.py",
+            line=1,
+            title="Bug",
+            body="Needs fixing",
+            discussion_id="human-1",
+            root_note_id=700,
+            thread_owner="human",
+            opened_sha="sha1",
+            last_seen_sha="sha1",
+        )
+        self.store.upsert_tracked_finding(tracked)
+
+        service = self._service(
+            gitlab,
+            FakeRepoManager(Path(self.tmpdir.name)),
+            FakeReviewAgentRunner(result=ReviewResult(summary="unused", overall_risk="low", findings=())),
+            reconcile_agent=FakeDiscussionReconcileAgent(
+                payload={
+                    "decision": "reply_only",
+                    "reason": "The bot should answer but keep the concern open.",
+                    "reply_body": "I still see a risk here because the guard is not local to this path.",
+                }
+            ),
+        )
+        self.store.enqueue_run(
+            1,
+            2,
+            "sha1",
+            None,
+            kind="discussion_reconcile",
+            trigger_discussion_id="human-1",
+            trigger_note_id=700,
+            trigger_author_id=123,
+        )
+        run = self.store.claim_next_run()
+        service.process_run(run)
+
+        updated = self.store.list_tracked_findings(1, 2)[0]
+        self.assertEqual(updated.status, "open")
+        self.assertFalse(gitlab.discussions[0].resolved)
+        self.assertIn("I still see a risk here", gitlab.discussions[0].notes[-1].body)
 
 
 if __name__ == "__main__":

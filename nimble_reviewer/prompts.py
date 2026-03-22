@@ -6,12 +6,14 @@ from nimble_reviewer.models import MergeRequestInfo, ReviewResult
 
 
 MAX_DIFF_CHARS = 200_000
+MAX_DISCUSSION_CHARS = 12_000
 
 
 def build_review_prompt(
     mr: MergeRequestInfo,
     diff_text: str,
     changed_files: list[str],
+    discussion_digest: str | None = None,
     repo_rules_text: str | None = None,
     repo_rules_path: str | None = None,
     repo_rules_truncated: bool = False,
@@ -34,6 +36,14 @@ Repository-specific review rules from `{repo_rules_path or "repository rules fil
 {repo_rules_notice}
 ```md
 {repo_rules_text}
+```
+"""
+    discussion_section = ""
+    if discussion_digest:
+        discussion_section = f"""
+Open and recent merge request discussion context:
+```md
+{discussion_digest[:MAX_DISCUSSION_CHARS]}
 ```
 """
     truncation_notice = (
@@ -67,6 +77,7 @@ Rules:
 - Keep each finding title short and specific.
 - Include `suggestion` only when you have a concrete, short remediation direction.
 - Use repository context when needed, but keep the final output concise and structured.
+- Consider existing MR discussion context. Do not restate concerns that have already been convincingly dismissed by discussion unless the visible diff reintroduces the risk.
 - Follow repository-specific review rules when provided, unless they conflict with the JSON output contract above.
 
 Merge request metadata:
@@ -81,6 +92,7 @@ Merge request metadata:
 Description:
 {mr.description or "(empty)"}
 {repo_rules_section}
+{discussion_section}
 
 Changed files:
 {changed_files_text}
@@ -88,6 +100,57 @@ Changed files:
 Unified diff:
 ```diff
 {diff_text}
+```"""
+
+
+def build_discussion_reconcile_prompt(
+    mr: MergeRequestInfo,
+    *,
+    discussion_id: str,
+    discussion_text: str,
+    trigger_note_body: str,
+    linked_finding_payload: dict | None,
+) -> str:
+    finding_json = json.dumps(linked_finding_payload or {}, indent=2, sort_keys=True)
+    return f"""You are reconciling a GitLab merge request discussion against an existing AI review finding.
+
+Return only strict JSON with this shape:
+{{
+  "decision": "keep_open|dismissed_by_discussion|reply_only|no_action",
+  "reason": "short rationale",
+  "reply_body": "optional short markdown reply"
+}}
+
+Rules:
+- `dismissed_by_discussion` means the human explanation convincingly resolves the bot concern.
+- Use `dismissed_by_discussion` only when the discussion contains a concrete technical explanation that removes the risk.
+- Use `reply_only` when the bot should respond but the concern should remain open or unresolved.
+- Use `keep_open` when the thread should stay open without any bot reply.
+- Use `no_action` when the note is irrelevant, too weak, or too ambiguous to act on.
+- Keep `reason` short and specific.
+- Include `reply_body` only when the bot should actually post a reply.
+- Never ask for more information. Decide from the discussion context.
+
+Merge request:
+- Project ID: {mr.project_id}
+- MR IID: {mr.mr_iid}
+- Title: {mr.title}
+- Source SHA: {mr.source_sha}
+- Web URL: {mr.web_url}
+
+Tracked finding:
+```json
+{finding_json}
+```
+
+Discussion {discussion_id}:
+```md
+{discussion_text[:MAX_DISCUSSION_CHARS]}
+```
+
+Latest human note:
+```md
+{trigger_note_body[:4000]}
 ```"""
 
 

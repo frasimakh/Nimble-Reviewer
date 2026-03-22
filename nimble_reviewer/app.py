@@ -16,7 +16,7 @@ from nimble_reviewer.runtime_state import prepare_claude_state
 from nimble_reviewer.service import ReviewService, ServiceDependencies
 from nimble_reviewer.store import Store
 from nimble_reviewer.trace import TraceSettings
-from nimble_reviewer.webhook import parse_merge_request_event
+from nimble_reviewer.webhook import parse_review_request_event
 from nimble_reviewer.worker import WorkerManager
 
 LOGGER = logging.getLogger(__name__)
@@ -41,12 +41,20 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     cfg.review_trace_dir.mkdir(parents=True, exist_ok=True)
     prepare_claude_state(Path.home())
 
+    gitlab = GitLabClient(cfg.gitlab_url, cfg.gitlab_token)
+    codex_runner = CodexRunner(cfg.codex_cmd, cfg.review_timeout_sec)
+    claude_runner = ClaudeRunner(cfg.claude_cmd, cfg.review_timeout_sec)
     service = ReviewService(
         ServiceDependencies(
             store=store,
-            gitlab=GitLabClient(cfg.gitlab_url, cfg.gitlab_token),
+            gitlab=gitlab,
             repo_manager=RepoManager(cfg.repo_cache_dir, cfg.gitlab_git_username, cfg.gitlab_token),
-            review_agent=_build_review_agent(cfg),
+            review_agent=CouncilRunner(
+                codex_runner=codex_runner,
+                claude_runner=claude_runner,
+                synthesis_provider=cfg.council_synthesis_provider,
+            ),
+            discussion_reconcile_agent=codex_runner if cfg.discussion_reconcile_provider == "codex" else claude_runner,
             trace_settings=TraceSettings(cfg.review_trace_dir),
         )
     )
@@ -91,7 +99,14 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         project_id = (payload.get("project") or {}).get("id", "unknown")
         mr_iid = attributes.get("iid", "unknown")
 
-        event = parse_merge_request_event(payload)
+        bot_user_id = None
+        if object_kind == "note":
+            try:
+                bot_user_id = gitlab.get_current_user().id
+            except Exception:  # noqa: BLE001
+                LOGGER.exception("Failed to resolve current GitLab user while processing note webhook")
+
+        event = parse_review_request_event(payload, bot_user_id=bot_user_id)
         if not event:
             LOGGER.info(
                 "Ignored webhook project=%s mr=%s object_kind=%s action=%s state=%s draft=%s sha=%s",
@@ -105,19 +120,30 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                     (attributes.get("last_commit") or {}).get("id")
                     or attributes.get("last_commit_id")
                     or attributes.get("sha")
+                    or (payload.get("merge_request") or {}).get("sha")
                 ),
             )
             response.status_code = 202
             return {"status": "ignored"}
 
-        decision = store.enqueue_run(event.project_id, event.mr_iid, event.source_sha, event.target_sha)
+        decision = store.enqueue_run(
+            event.project_id,
+            event.mr_iid,
+            event.source_sha,
+            event.target_sha,
+            kind=event.kind,
+            trigger_discussion_id=event.trigger_discussion_id,
+            trigger_note_id=event.trigger_note_id,
+            trigger_author_id=event.trigger_author_id,
+        )
         LOGGER.info(
-            "Webhook decision status=%s reason=%s run_id=%s project=%s mr=%s action=%s sha=%s target_sha=%s",
+            "Webhook decision status=%s reason=%s run_id=%s project=%s mr=%s kind=%s action=%s sha=%s target_sha=%s",
             "queued" if decision.enqueued else "ignored",
             decision.reason,
             decision.run_id,
             event.project_id,
             event.mr_iid,
+            event.kind,
             event.action,
             _short_sha(event.source_sha),
             _short_sha(event.target_sha),
@@ -141,18 +167,6 @@ def _configure_logging() -> None:
         level=logging.INFO,
         format="%(asctime)s %(levelname)s %(name)s %(message)s",
     )
-
-
-def _build_review_agent(settings: Settings):
-    codex_runner = CodexRunner(settings.codex_cmd, settings.review_timeout_sec)
-    claude_runner = ClaudeRunner(settings.claude_cmd, settings.review_timeout_sec)
-    return CouncilRunner(
-        codex_runner=codex_runner,
-        claude_runner=claude_runner,
-        synthesis_provider=settings.council_synthesis_provider,
-    )
-
-
 def _short_sha(value: str | None) -> str:
     if not value:
         return "-"

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import re
 
 from nimble_reviewer.models import ReviewFinding
@@ -26,6 +27,20 @@ def findings_match(left: ReviewFinding, right: ReviewFinding) -> bool:
     if close_lines and combined_overlap >= 0.28:
         return True
     return False
+
+
+def finding_fingerprint(finding: ReviewFinding) -> str:
+    normalized_title = _normalize_text(finding.title)
+    normalized_body = _normalize_text(finding.body)
+    payload = "|".join(
+        [
+            finding.file.strip().lower(),
+            str(finding.line),
+            normalized_title,
+            normalized_body,
+        ]
+    )
+    return hashlib.sha1(payload.encode("utf-8")).hexdigest()
 
 
 def _token_overlap(left: str, right: str) -> float:

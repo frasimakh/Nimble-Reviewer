@@ -1,22 +1,39 @@
 from __future__ import annotations
 
-import logging
 import json
+import logging
 import time
 from dataclasses import dataclass
 from pathlib import Path
 
-from nimble_reviewer.finding_match import findings_match
-from nimble_reviewer.gitlab import GitLabClient
+from nimble_reviewer.diff_mapping import DiffMapping, build_diff_mapping
+from nimble_reviewer.finding_match import finding_fingerprint, findings_match
+from nimble_reviewer.gitlab import GitLabClient, GitLabDiscussion
 from nimble_reviewer.gitops import RepoManager
-from nimble_reviewer.models import ReviewAgentMetadata, ReviewComparison, ReviewFinding, ReviewFindingState, ReviewOpinion, ReviewParticipant, ReviewResult, ReviewRun, ReviewTokenUsage
-from nimble_reviewer.prompts import build_review_prompt
-from nimble_reviewer.review_agent import ReviewAgentRunner
+from nimble_reviewer.models import (
+    DiscussionReconcileResult,
+    ReviewAgentMetadata,
+    ReviewComparison,
+    ReviewFinding,
+    ReviewFindingState,
+    ReviewOpinion,
+    ReviewParticipant,
+    ReviewResult,
+    ReviewRun,
+    ReviewSummaryMetrics,
+    ReviewTokenUsage,
+    ThreadOwner,
+    TrackedFinding,
+)
+from nimble_reviewer.prompts import build_discussion_reconcile_prompt, build_review_prompt
 from nimble_reviewer.renderer import note_marker, render_failure_note, render_success_note
+from nimble_reviewer.review_agent import JsonCapableReviewAgent, ReviewAgentRunner, _review_result_from_payload
 from nimble_reviewer.store import Store
 from nimble_reviewer.trace import RunTrace, TraceSettings
 
 LOGGER = logging.getLogger(__name__)
+
+FINDING_MARKER_PREFIX = "<!-- nimble-reviewer:finding:"
 
 
 @dataclass(frozen=True)
@@ -25,7 +42,23 @@ class ServiceDependencies:
     gitlab: GitLabClient
     repo_manager: RepoManager
     review_agent: ReviewAgentRunner
+    discussion_reconcile_agent: JsonCapableReviewAgent
     trace_settings: TraceSettings
+
+
+@dataclass(frozen=True)
+class _PublishedFinding:
+    finding: ReviewFinding
+    placement: str
+    discussion_id: str | None
+    thread_owner: ThreadOwner
+
+
+@dataclass(frozen=True)
+class _PublishedReviewState:
+    metrics: ReviewSummaryMetrics
+    current_states: tuple[ReviewFindingState, ...]
+    unplaced_findings: tuple[ReviewFinding, ...]
 
 
 class ReviewService:
@@ -34,15 +67,21 @@ class ReviewService:
         self.gitlab = deps.gitlab
         self.repo_manager = deps.repo_manager
         self.review_agent = deps.review_agent
+        self.discussion_reconcile_agent = deps.discussion_reconcile_agent
         self.trace_settings = deps.trace_settings
 
     def process_run(self, run: ReviewRun) -> None:
         if self.store.get_run_status(run.id) != "running":
             LOGGER.info("Skipping run %s because it is no longer running", run.id)
             return
+        if run.kind == "discussion_reconcile":
+            self._process_discussion_reconcile_run(run)
+            return
+        self._process_full_review_run(run)
 
+    def _process_full_review_run(self, run: ReviewRun) -> None:
         LOGGER.info(
-            "Starting review run_id=%s project=%s mr=%s sha=%s",
+            "Starting full review run_id=%s project=%s mr=%s sha=%s",
             run.id,
             run.project_id,
             run.mr_iid,
@@ -54,6 +93,7 @@ class ReviewService:
                 "app",
                 "review.started",
                 run_id=run.id,
+                run_kind=run.kind,
                 project_id=run.project_id,
                 mr_iid=run.mr_iid,
                 source_sha=_short_sha(run.source_sha),
@@ -61,138 +101,76 @@ class ReviewService:
         try:
             started = time.monotonic()
             mr_info = self.gitlab.get_merge_request_info(run.project_id, run.mr_iid)
-            LOGGER.info(
-                "Fetched MR metadata run_id=%s title=%r source_branch=%s target_branch=%s sha=%s",
-                run.id,
-                mr_info.title,
-                mr_info.source_branch,
-                mr_info.target_branch,
-                _short_sha(mr_info.source_sha),
-            )
-            if trace:
-                trace.write(
-                    "app",
-                    "mr.metadata.loaded",
-                    run_id=run.id,
-                    title=mr_info.title,
-                    source_branch=mr_info.source_branch,
-                    target_branch=mr_info.target_branch,
-                    source_sha=_short_sha(mr_info.source_sha),
-                )
-            if mr_info.source_sha != run.source_sha:
+            if run.source_sha and mr_info.source_sha != run.source_sha:
                 self.store.mark_superseded_if_running(run.id)
                 LOGGER.info("Run %s is stale; GitLab head is now %s", run.id, mr_info.source_sha)
-                if trace:
-                    trace.write(
-                        "app",
-                        "review.stale_before_checkout",
-                        run_id=run.id,
-                        current_head_sha=_short_sha(mr_info.source_sha),
-                    )
                 return
 
-            checkout_started = time.monotonic()
             checkout = self.repo_manager.prepare_checkout(
                 mr_info.repo_http_url,
-                run.source_sha,
+                mr_info.source_sha,
                 mr_info.target_branch,
                 trace=trace,
             )
             try:
-                LOGGER.info(
-                    "Checkout ready run_id=%s dir=%s merge_base=%s changed_files=%s review_rules=%s checkout_sec=%.2f",
-                    run.id,
-                    checkout.path,
-                    _short_sha(checkout.merge_base),
-                    len(checkout.changed_files),
-                    checkout.review_rules_path or "-",
-                    time.monotonic() - checkout_started,
-                )
-                if trace:
-                    trace.write(
-                        "app",
-                        "checkout.ready",
-                        run_id=run.id,
-                        checkout_dir=str(checkout.path),
-                        merge_base=_short_sha(checkout.merge_base),
-                        changed_files=checkout.changed_files,
-                        review_rules_path=checkout.review_rules_path,
-                    )
+                discussions = self.gitlab.list_merge_request_discussions(run.project_id, run.mr_iid)
+                tracked_findings = self.store.list_tracked_findings(run.project_id, run.mr_iid)
+                discussion_digest = _build_discussion_digest(discussions, checkout.changed_files, tracked_findings)
                 prompt = build_review_prompt(
                     mr_info,
                     checkout.diff_text,
                     checkout.changed_files,
+                    discussion_digest=discussion_digest,
                     repo_rules_text=checkout.review_rules_text,
                     repo_rules_path=checkout.review_rules_path,
                     repo_rules_truncated=checkout.review_rules_truncated,
                 )
-                LOGGER.info(
-                    "Starting %s review run_id=%s prompt_bytes=%s diff_bytes=%s review_rules=%s",
-                    self.review_agent.provider_name,
-                    run.id,
-                    len(prompt.encode("utf-8")),
-                    len(checkout.diff_text.encode("utf-8")),
-                    checkout.review_rules_path or "-",
-                )
-                if trace:
-                    trace.write(
-                        "app",
-                        "provider.started",
-                        run_id=run.id,
-                        provider=self.review_agent.provider_name,
-                        prompt_bytes=len(prompt.encode("utf-8")),
-                        diff_bytes=len(checkout.diff_text.encode("utf-8")),
-                    )
-                agent_started = time.monotonic()
                 result = self.review_agent.review(prompt, checkout.path, trace=trace)
                 result = _enrich_result_for_rendering(result, checkout.path)
-                previous_result = self._load_previous_success_result(run)
+                diff_mapping = build_diff_mapping(checkout.diff_text)
+                result = _suppress_dismissed_findings(result, tracked_findings, diff_mapping)
+                previous_result = self._load_previous_success_result(run, kind="full_review")
                 comparison = _build_review_comparison(previous_result, result)
                 if trace:
                     trace.write_snapshot("review.final", _review_result_snapshot_payload(result))
-                LOGGER.info(
-                    "%s finished run_id=%s findings=%s overall_risk=%s agent_sec=%.2f",
-                    self.review_agent.provider_name,
-                    run.id,
-                    len(result.findings),
-                    result.overall_risk,
-                    time.monotonic() - agent_started,
-                )
-                if trace:
-                    trace.write(
-                        "app",
-                        "provider.completed",
-                        run_id=run.id,
-                        provider=self.review_agent.provider_name,
-                        findings=len(result.findings),
-                        overall_risk=result.overall_risk,
-                        token_usage=_token_usage_payload(result),
-                        agent_metadata=_agent_metadata_payload(result),
-                        participants=_participants_payload(result),
-                    )
             finally:
                 checkout.close()
-                LOGGER.info("Cleaned checkout for run_id=%s", run.id)
-                if trace:
-                    trace.write("app", "checkout.cleaned", run_id=run.id)
 
             if self.store.get_run_status(run.id) != "running":
                 LOGGER.info("Run %s was superseded before publish", run.id)
-                if trace:
-                    trace.write("app", "review.superseded_before_publish", run_id=run.id)
                 return
-            if self.gitlab.get_merge_request_head_sha(run.project_id, run.mr_iid) != run.source_sha:
+            if self.gitlab.get_merge_request_head_sha(run.project_id, run.mr_iid) != mr_info.source_sha:
                 self.store.mark_superseded_if_running(run.id)
                 LOGGER.info("Run %s became stale before publish", run.id)
-                if trace:
-                    trace.write("app", "review.stale_before_publish", run_id=run.id)
                 return
 
-            note = self._upsert_success_note(run.project_id, run.mr_iid, run.source_sha, result, comparison)
-            self.store.update_note_id(run.project_id, run.mr_iid, note.id)
-            self.store.mark_done(run.id, run.project_id, run.mr_iid, run.source_sha)
+            latest_version = self.gitlab.get_latest_merge_request_version(run.project_id, run.mr_iid)
+            current_discussions = self.gitlab.list_merge_request_discussions(run.project_id, run.mr_iid)
+            publication = self._publish_review_findings(
+                project_id=run.project_id,
+                mr_iid=run.mr_iid,
+                source_sha=mr_info.source_sha,
+                result=result,
+                comparison=comparison,
+                tracked_findings=tracked_findings,
+                discussions=current_discussions,
+                diff_mapping=diff_mapping,
+                latest_version=latest_version,
+            )
+
+            note = self._upsert_success_note(
+                run.project_id,
+                run.mr_iid,
+                mr_info.source_sha,
+                result,
+                publication.metrics,
+                comparison,
+                publication.unplaced_findings,
+            )
+            self.store.update_summary_note_id(run.project_id, run.mr_iid, note.id)
+            self.store.mark_done(run.id, run.project_id, run.mr_iid, mr_info.source_sha)
             LOGGER.info(
-                "Completed review run_id=%s note_id=%s total_sec=%.2f",
+                "Completed full review run_id=%s note_id=%s total_sec=%.2f",
                 run.id,
                 note.id,
                 time.monotonic() - started,
@@ -202,84 +180,349 @@ class ReviewService:
                     "app",
                     "review.completed",
                     run_id=run.id,
+                    run_kind=run.kind,
                     note_id=note.id,
                     total_sec=round(time.monotonic() - started, 3),
                 )
         except Exception as exc:  # noqa: BLE001
-            LOGGER.exception("Review run %s failed", run.id)
+            LOGGER.exception("Full review run %s failed", run.id)
             if trace:
-                trace.write("app", "review.failed", run_id=run.id, error=str(exc))
+                trace.write("app", "review.failed", run_id=run.id, run_kind=run.kind, error=str(exc))
             if not self.store.mark_failed(run.id, run.project_id, run.mr_iid, run.source_sha, str(exc)):
                 return
             try:
                 note = self._upsert_failure_note(run.project_id, run.mr_iid, run.source_sha, str(exc))
-                self.store.update_note_id(run.project_id, run.mr_iid, note.id)
-                LOGGER.info("Published failure note run_id=%s note_id=%s", run.id, note.id)
-                if trace:
-                    trace.write("app", "failure_note.published", run_id=run.id, note_id=note.id)
+                self.store.update_summary_note_id(run.project_id, run.mr_iid, note.id)
             except Exception:  # noqa: BLE001
                 LOGGER.exception("Failed to publish failure note for run %s", run.id)
-                if trace:
-                    trace.write("app", "failure_note.publish_failed", run_id=run.id)
 
-    def _upsert_success_note(self, project_id: int, mr_iid: int, source_sha: str, result, comparison: ReviewComparison):
-        state = self.store.get_merge_request_state(project_id, mr_iid)
-        marker = note_marker(project_id, mr_iid)
-        existing = self.gitlab.find_bot_note(project_id, mr_iid, marker, state.note_id if state else None)
-        body = render_success_note(project_id, mr_iid, source_sha, result, comparison=comparison)
-        if existing:
-            LOGGER.info(
-                "Updating success note project=%s mr=%s note_id=%s sha=%s findings=%s",
-                project_id,
-                mr_iid,
-                existing.id,
-                _short_sha(source_sha),
-                len(result.findings),
-            )
-            return self.gitlab.update_note(project_id, mr_iid, existing.id, body)
+    def _process_discussion_reconcile_run(self, run: ReviewRun) -> None:
         LOGGER.info(
-            "Creating success note project=%s mr=%s sha=%s findings=%s",
-            project_id,
-            mr_iid,
-            _short_sha(source_sha),
-            len(result.findings),
+            "Starting discussion reconcile run_id=%s project=%s mr=%s discussion=%s note=%s",
+            run.id,
+            run.project_id,
+            run.mr_iid,
+            run.trigger_discussion_id or "-",
+            run.trigger_note_id or "-",
         )
-        return self.gitlab.create_note(project_id, mr_iid, body)
+        trace = self._create_trace(run)
+        try:
+            mr_info = self.gitlab.get_merge_request_info(run.project_id, run.mr_iid)
+            discussions = self.gitlab.list_merge_request_discussions(run.project_id, run.mr_iid)
+            discussion = _find_discussion(discussions, run.trigger_discussion_id, run.trigger_note_id)
+            if discussion is None:
+                self.store.mark_done(run.id, run.project_id, run.mr_iid, mr_info.source_sha)
+                return
+
+            tracked_findings = self.store.list_tracked_findings(run.project_id, run.mr_iid)
+            tracked = self.store.get_tracked_finding_by_discussion(run.project_id, run.mr_iid, discussion.id)
+            if tracked is None:
+                tracked = _match_discussion_to_tracked_finding(discussion, tracked_findings)
+            if tracked is None or tracked.status != "open":
+                self.store.mark_done(run.id, run.project_id, run.mr_iid, mr_info.source_sha)
+                return
+
+            trigger_note = _find_note_in_discussion(discussion, run.trigger_note_id)
+            prompt = build_discussion_reconcile_prompt(
+                mr_info,
+                discussion_id=discussion.id,
+                discussion_text=_render_discussion_context(discussion),
+                trigger_note_body=(trigger_note.body if trigger_note else discussion.root_note.body if discussion.root_note else ""),
+                linked_finding_payload=_tracked_finding_payload(tracked),
+            )
+            payload, _ = self.discussion_reconcile_agent.run_json(prompt, Path.cwd(), trace=trace)
+            decision = _parse_discussion_reconcile_result(payload)
+            if trace:
+                trace.write_snapshot("discussion.reconcile", payload)
+
+            if decision.reply_body:
+                self.gitlab.add_discussion_note(run.project_id, run.mr_iid, discussion.id, _reply_with_marker(decision.reply_body, tracked.fingerprint))
+            if decision.decision == "dismissed_by_discussion":
+                tracked = TrackedFinding(
+                    **{
+                        **tracked.__dict__,
+                        "status": "dismissed_by_discussion",
+                        "dismissed_sha": mr_info.source_sha,
+                        "updated_at": None,
+                    }
+                )
+                self.store.upsert_tracked_finding(tracked)
+                if tracked.thread_owner == "bot" and not discussion.resolved:
+                    self.gitlab.set_discussion_resolved(run.project_id, run.mr_iid, discussion.id, resolved=True)
+            elif decision.decision in {"reply_only", "keep_open"}:
+                tracked = TrackedFinding(
+                    **{
+                        **tracked.__dict__,
+                        "last_seen_sha": mr_info.source_sha,
+                        "updated_at": None,
+                    }
+                )
+                self.store.upsert_tracked_finding(tracked)
+
+            latest_result = self._load_previous_success_result(run, kind="full_review") or ReviewResult(
+                summary="No completed full review is available yet.",
+                overall_risk="low",
+                findings=(),
+            )
+            current_tracked = self.store.list_tracked_findings(run.project_id, run.mr_iid)
+            metrics = _metrics_from_tracked_findings(current_tracked)
+            unplaced_findings = tuple(
+                _tracked_finding_to_review_finding(item)
+                for item in current_tracked
+                if item.status == "open" and item.thread_owner == "summary-only"
+            )
+            note = self._upsert_success_note(
+                run.project_id,
+                run.mr_iid,
+                mr_info.source_sha,
+                latest_result,
+                metrics,
+                None,
+                unplaced_findings,
+            )
+            self.store.update_summary_note_id(run.project_id, run.mr_iid, note.id)
+            self.store.mark_done(run.id, run.project_id, run.mr_iid, mr_info.source_sha)
+        except Exception as exc:  # noqa: BLE001
+            LOGGER.exception("Discussion reconcile run %s failed", run.id)
+            if not self.store.mark_failed(run.id, run.project_id, run.mr_iid, run.source_sha, str(exc)):
+                return
+
+    def _publish_review_findings(
+        self,
+        *,
+        project_id: int,
+        mr_iid: int,
+        source_sha: str,
+        result: ReviewResult,
+        comparison: ReviewComparison,
+        tracked_findings: list[TrackedFinding],
+        discussions: list[GitLabDiscussion],
+        diff_mapping: DiffMapping,
+        latest_version,
+    ) -> _PublishedReviewState:
+        bot_user_id = self.gitlab.get_current_user().id
+        discussions_by_id = {discussion.id: discussion for discussion in discussions}
+        used_tracked: set[str] = set()
+        current_states: list[ReviewFindingState] = []
+        unplaced_findings: list[ReviewFinding] = []
+        current_open_fingerprints: set[str] = set()
+
+        for finding_state in comparison.current_findings:
+            finding = finding_state.finding
+            tracked = _match_tracked_finding(
+                finding,
+                tracked_findings,
+                used_fingerprints=used_tracked,
+                diff_mapping=diff_mapping,
+            )
+            placement = "summary"
+            discussion_id = None
+            thread_owner: ThreadOwner = "summary-only"
+
+            if tracked and tracked.discussion_id:
+                discussion = discussions_by_id.get(tracked.discussion_id)
+                if discussion and tracked.thread_owner != "summary-only":
+                    placement = "inline"
+                    discussion_id = tracked.discussion_id
+                    thread_owner = tracked.thread_owner
+                    if tracked.thread_owner == "bot" and discussion.resolved:
+                        self.gitlab.set_discussion_resolved(project_id, mr_iid, discussion.id, resolved=False)
+                elif tracked.thread_owner == "summary-only":
+                    tracked = None
+
+            if tracked is None:
+                human_discussion = _find_relevant_human_discussion(finding, discussions, bot_user_id=bot_user_id)
+                if human_discussion is not None:
+                    self.gitlab.add_discussion_note(
+                        project_id,
+                        mr_iid,
+                        human_discussion.id,
+                        _reply_with_marker(_render_thread_reply(finding), finding_fingerprint(finding)),
+                    )
+                    discussion_id = human_discussion.id
+                    thread_owner = "human"
+                    placement = "inline"
+                    tracked = TrackedFinding(
+                        project_id=project_id,
+                        mr_iid=mr_iid,
+                        fingerprint=finding_fingerprint(finding),
+                        status="open",
+                        severity=finding.severity,
+                        file=finding.file,
+                        line=finding.line,
+                        title=finding.title,
+                        body=finding.body,
+                        suggestion=finding.suggestion,
+                        sources=finding.sources,
+                        discussion_id=human_discussion.id,
+                        root_note_id=human_discussion.root_note.id if human_discussion.root_note else None,
+                        thread_owner="human",
+                        opened_sha=source_sha,
+                        last_seen_sha=source_sha,
+                        context_snippet=finding.snippet,
+                    )
+                else:
+                    position = diff_mapping.to_position(finding.file, finding.line, latest_version)
+                    if position is not None:
+                        discussion = self.gitlab.create_diff_discussion(
+                            project_id,
+                            mr_iid,
+                            _render_finding_thread_body(finding, finding_fingerprint(finding)),
+                            position,
+                        )
+                        discussion_id = discussion.id
+                        thread_owner = "bot"
+                        placement = "inline"
+                        tracked = TrackedFinding(
+                            project_id=project_id,
+                            mr_iid=mr_iid,
+                            fingerprint=finding_fingerprint(finding),
+                            status="open",
+                            severity=finding.severity,
+                            file=finding.file,
+                            line=finding.line,
+                            title=finding.title,
+                            body=finding.body,
+                            suggestion=finding.suggestion,
+                            sources=finding.sources,
+                            discussion_id=discussion.id,
+                            root_note_id=discussion.root_note.id if discussion.root_note else None,
+                            thread_owner="bot",
+                            opened_sha=source_sha,
+                            last_seen_sha=source_sha,
+                            context_snippet=finding.snippet,
+                        )
+                    else:
+                        tracked = TrackedFinding(
+                            project_id=project_id,
+                            mr_iid=mr_iid,
+                            fingerprint=finding_fingerprint(finding),
+                            status="open",
+                            severity=finding.severity,
+                            file=finding.file,
+                            line=finding.line,
+                            title=finding.title,
+                            body=finding.body,
+                            suggestion=finding.suggestion,
+                            sources=finding.sources,
+                            thread_owner="summary-only",
+                            opened_sha=source_sha,
+                            last_seen_sha=source_sha,
+                            context_snippet=finding.snippet,
+                        )
+                        unplaced_findings.append(finding)
+
+            tracked = TrackedFinding(
+                **{
+                    **tracked.__dict__,
+                    "status": "open",
+                    "severity": finding.severity,
+                    "file": finding.file,
+                    "line": finding.line,
+                    "title": finding.title,
+                    "body": finding.body,
+                    "suggestion": finding.suggestion,
+                    "sources": finding.sources,
+                    "last_seen_sha": source_sha,
+                    "context_snippet": finding.snippet,
+                    "updated_at": None,
+                }
+            )
+            self.store.upsert_tracked_finding(tracked)
+            used_tracked.add(tracked.fingerprint)
+            current_open_fingerprints.add(tracked.fingerprint)
+            current_states.append(
+                ReviewFindingState(
+                    finding=finding,
+                    status=finding_state.status,
+                    placement=placement,  # type: ignore[arg-type]
+                    discussion_id=discussion_id,
+                    thread_owner=thread_owner,
+                )
+            )
+
+        resolved_count = 0
+        for tracked in tracked_findings:
+            if tracked.status != "open":
+                continue
+            if tracked.fingerprint in current_open_fingerprints:
+                continue
+            if tracked.thread_owner == "bot" and tracked.discussion_id:
+                discussion = discussions_by_id.get(tracked.discussion_id)
+                if discussion and not discussion.resolved:
+                    self.gitlab.set_discussion_resolved(project_id, mr_iid, tracked.discussion_id, resolved=True)
+            resolved = TrackedFinding(
+                **{
+                    **tracked.__dict__,
+                    "status": "resolved",
+                    "resolved_sha": source_sha,
+                    "updated_at": None,
+                }
+            )
+            self.store.upsert_tracked_finding(resolved)
+            resolved_count += 1
+
+        dismissed_count = sum(1 for item in self.store.list_tracked_findings(project_id, mr_iid) if item.status == "dismissed_by_discussion")
+        metrics = ReviewSummaryMetrics(
+            open_count=len(current_states),
+            new_count=sum(1 for item in current_states if item.status == "new"),
+            still_present_count=sum(1 for item in current_states if item.status == "still_present"),
+            resolved_count=resolved_count,
+            dismissed_count=dismissed_count,
+            unplaced_count=len(unplaced_findings),
+        )
+        return _PublishedReviewState(
+            metrics=metrics,
+            current_states=tuple(current_states),
+            unplaced_findings=tuple(unplaced_findings),
+        )
 
     def _create_trace(self, run: ReviewRun) -> RunTrace | None:
         path = self.trace_settings.directory / f"run-{run.id}.jsonl"
         LOGGER.info("Trace enabled for run_id=%s path=%s", run.id, path)
         return RunTrace(path)
 
-    def _upsert_failure_note(self, project_id: int, mr_iid: int, source_sha: str, error: str):
+    def _upsert_success_note(
+        self,
+        project_id: int,
+        mr_iid: int,
+        source_sha: str | None,
+        result: ReviewResult,
+        metrics: ReviewSummaryMetrics,
+        comparison: ReviewComparison | None,
+        unplaced_findings: tuple[ReviewFinding, ...],
+    ):
         state = self.store.get_merge_request_state(project_id, mr_iid)
         marker = note_marker(project_id, mr_iid)
-        existing = self.gitlab.find_bot_note(project_id, mr_iid, marker, state.note_id if state else None)
-        body = render_failure_note(project_id, mr_iid, source_sha, error, existing.body if existing else None)
-        if existing:
-            LOGGER.info(
-                "Updating failure note project=%s mr=%s note_id=%s sha=%s",
-                project_id,
-                mr_iid,
-                existing.id,
-                _short_sha(source_sha),
-            )
-            return self.gitlab.update_note(project_id, mr_iid, existing.id, body)
-        LOGGER.info(
-            "Creating failure note project=%s mr=%s sha=%s",
+        existing = self.gitlab.find_bot_note(project_id, mr_iid, marker, state.summary_note_id if state else None)
+        body = render_success_note(
             project_id,
             mr_iid,
-            _short_sha(source_sha),
+            source_sha or "",
+            result,
+            metrics=metrics,
+            comparison=comparison,
+            unplaced_findings=unplaced_findings,
         )
+        if existing:
+            return self.gitlab.update_note(project_id, mr_iid, existing.id, body)
         return self.gitlab.create_note(project_id, mr_iid, body)
 
-    def _load_previous_success_result(self, run: ReviewRun) -> ReviewResult | None:
-        previous_run = self.store.get_latest_done_run(run.project_id, run.mr_iid)
+    def _upsert_failure_note(self, project_id: int, mr_iid: int, source_sha: str | None, error: str):
+        state = self.store.get_merge_request_state(project_id, mr_iid)
+        marker = note_marker(project_id, mr_iid)
+        existing = self.gitlab.find_bot_note(project_id, mr_iid, marker, state.summary_note_id if state else None)
+        body = render_failure_note(project_id, mr_iid, source_sha or "", error, existing.body if existing else None)
+        if existing:
+            return self.gitlab.update_note(project_id, mr_iid, existing.id, body)
+        return self.gitlab.create_note(project_id, mr_iid, body)
+
+    def _load_previous_success_result(self, run: ReviewRun, *, kind: str) -> ReviewResult | None:
+        previous_run = self.store.get_latest_done_run(run.project_id, run.mr_iid, kind=kind)  # type: ignore[arg-type]
         if not previous_run:
             return None
         snapshot_path = self.trace_settings.directory / f"run-{previous_run.id}.review.final.json"
         if not snapshot_path.is_file():
-            LOGGER.info("Previous review snapshot missing run_id=%s path=%s", previous_run.id, snapshot_path)
             return None
         try:
             payload = json.loads(snapshot_path.read_text(encoding="utf-8"))
@@ -295,47 +538,227 @@ def _short_sha(value: str | None) -> str:
     return value[:12]
 
 
-def _token_usage_payload(result_or_usage) -> dict | None:
-    token_usage = getattr(result_or_usage, "token_usage", result_or_usage)
-    if not token_usage:
-        return None
-    return {
-        "input_tokens": token_usage.input_tokens,
-        "cached_input_tokens": token_usage.cached_input_tokens,
-        "cache_creation_input_tokens": token_usage.cache_creation_input_tokens,
-        "output_tokens": token_usage.output_tokens,
-        "total_tokens": token_usage.total_tokens,
-        "cost_usd": token_usage.cost_usd,
-    }
+def _build_discussion_digest(
+    discussions: list[GitLabDiscussion],
+    changed_files: list[str],
+    tracked_findings: list[TrackedFinding],
+) -> str:
+    linked_discussions = {item.discussion_id for item in tracked_findings if item.discussion_id}
+    changed_file_set = set(changed_files)
+    blocks: list[str] = []
+    for discussion in discussions:
+        file_path = discussion.position.new_path if discussion.position else None
+        if not discussion.resolved and (file_path in changed_file_set or discussion.id in linked_discussions):
+            blocks.append(_render_discussion_context(discussion))
+        elif discussion.id in linked_discussions:
+            blocks.append(_render_discussion_context(discussion))
+        if sum(len(block) for block in blocks) > 10_000:
+            break
+    return "\n\n".join(blocks)
 
 
-def _agent_metadata_payload(result) -> dict | None:
-    if not result.agent_metadata:
-        return None
-    return {
-        "provider": result.agent_metadata.provider,
-        "model": result.agent_metadata.model,
-        "reasoning_effort": result.agent_metadata.reasoning_effort,
-    }
+def _render_discussion_context(discussion: GitLabDiscussion) -> str:
+    location = ""
+    if discussion.position:
+        line = discussion.position.new_line or discussion.position.old_line or "?"
+        location = f" at {discussion.position.new_path}:{line}"
+    lines = [f"Discussion {discussion.id}{location} ({'resolved' if discussion.resolved else 'open'})"]
+    for note in discussion.notes:
+        author = f"user:{note.author_id}" if note.author_id is not None else "user:unknown"
+        lines.append(f"- {author}: {note.body.strip()}")
+    return "\n".join(lines)
 
 
-def _participants_payload(result) -> list[dict] | None:
-    if not getattr(result, "participants", None):
-        return None
-    payload: list[dict] = []
-    for participant in result.participants:
-        payload.append(
-            {
-                "provider": participant.metadata.provider,
-                "model": participant.metadata.model,
-                "reasoning_effort": participant.metadata.reasoning_effort,
-                "phases": list(participant.phases),
-                "token_usage": _token_usage_payload(participant.token_usage),
-                "summary": participant.summary,
-                "overall_risk": participant.overall_risk,
-            }
+def _match_tracked_finding(
+    finding: ReviewFinding,
+    tracked_findings: list[TrackedFinding],
+    *,
+    used_fingerprints: set[str],
+    diff_mapping: DiffMapping,
+) -> TrackedFinding | None:
+    exact_fingerprint = finding_fingerprint(finding)
+    candidates = [
+        item
+        for item in tracked_findings
+        if item.fingerprint not in used_fingerprints
+    ]
+    for item in candidates:
+        if item.fingerprint == exact_fingerprint:
+            return item
+
+    prioritized = sorted(
+        candidates,
+        key=lambda item: (
+            0 if item.status == "open" else 1 if item.status == "dismissed_by_discussion" else 2,
+            0 if item.thread_owner != "summary-only" else 1,
+        ),
+    )
+    for item in prioritized:
+        if item.status == "dismissed_by_discussion" and not diff_mapping.has_changes_near(item.file, item.line):
+            continue
+        if findings_match(finding, _tracked_finding_to_review_finding(item)):
+            return item
+    return None
+
+
+def _tracked_finding_to_review_finding(item: TrackedFinding) -> ReviewFinding:
+    return ReviewFinding(
+        severity=item.severity,
+        file=item.file,
+        line=item.line,
+        title=item.title,
+        body=item.body,
+        suggestion=item.suggestion,
+        sources=item.sources,
+        snippet=item.context_snippet,
+    )
+
+
+def _find_relevant_human_discussion(
+    finding: ReviewFinding,
+    discussions: list[GitLabDiscussion],
+    *,
+    bot_user_id: int,
+) -> GitLabDiscussion | None:
+    for discussion in discussions:
+        if discussion.root_note and discussion.root_note.author_id == bot_user_id:
+            continue
+        if discussion.position and discussion.position.new_path == finding.file:
+            line = discussion.position.new_line or discussion.position.old_line or 0
+            if abs(line - finding.line) <= 3:
+                return discussion
+        discussion_text = " ".join(note.body for note in discussion.notes)
+        synthetic = ReviewFinding(
+            severity=finding.severity,
+            file=discussion.position.new_path if discussion.position else finding.file,
+            line=discussion.position.new_line or discussion.position.old_line or finding.line if discussion.position else finding.line,
+            title=discussion.root_note.body[:80] if discussion.root_note else finding.title,
+            body=discussion_text or finding.body,
         )
-    return payload
+        if findings_match(finding, synthetic):
+            return discussion
+    return None
+
+
+def _find_discussion(
+    discussions: list[GitLabDiscussion],
+    discussion_id: str | None,
+    note_id: int | None,
+) -> GitLabDiscussion | None:
+    if discussion_id:
+        for discussion in discussions:
+            if discussion.id == discussion_id:
+                return discussion
+    if note_id is not None:
+        for discussion in discussions:
+            if any(note.id == note_id for note in discussion.notes):
+                return discussion
+    return None
+
+
+def _find_note_in_discussion(discussion: GitLabDiscussion, note_id: int | None):
+    if note_id is None:
+        return discussion.notes[-1] if discussion.notes else None
+    for note in discussion.notes:
+        if note.id == note_id:
+            return note
+    return discussion.notes[-1] if discussion.notes else None
+
+
+def _match_discussion_to_tracked_finding(
+    discussion: GitLabDiscussion,
+    tracked_findings: list[TrackedFinding],
+) -> TrackedFinding | None:
+    for tracked in tracked_findings:
+        if tracked.discussion_id == discussion.id:
+            return tracked
+    synthetic = ReviewFinding(
+        severity="low",
+        file=discussion.position.new_path if discussion.position else "",
+        line=discussion.position.new_line or discussion.position.old_line or 1 if discussion.position else 1,
+        title=discussion.root_note.body[:80] if discussion.root_note else "discussion",
+        body=" ".join(note.body for note in discussion.notes),
+    )
+    for tracked in tracked_findings:
+        if tracked.status != "open":
+            continue
+        if tracked.file and synthetic.file and tracked.file != synthetic.file:
+            continue
+        if findings_match(_tracked_finding_to_review_finding(tracked), synthetic):
+            return tracked
+    return None
+
+
+def _tracked_finding_payload(tracked: TrackedFinding) -> dict:
+    return {
+        "fingerprint": tracked.fingerprint,
+        "status": tracked.status,
+        "severity": tracked.severity,
+        "file": tracked.file,
+        "line": tracked.line,
+        "title": tracked.title,
+        "body": tracked.body,
+        "suggestion": tracked.suggestion,
+        "sources": list(tracked.sources),
+        "thread_owner": tracked.thread_owner,
+        "context_snippet": tracked.context_snippet,
+    }
+
+
+def _parse_discussion_reconcile_result(payload: dict) -> DiscussionReconcileResult:
+    decision = str(payload.get("decision", "")).strip().lower()
+    if decision not in {"keep_open", "dismissed_by_discussion", "reply_only", "no_action"}:
+        raise RuntimeError(f"Invalid discussion reconcile decision: {decision!r}")
+    reason = str(payload.get("reason", "")).strip()
+    if not reason:
+        raise RuntimeError("Discussion reconcile result requires a reason")
+    reply_body = str(payload.get("reply_body", "")).strip() or None
+    return DiscussionReconcileResult(decision=decision, reason=reason, reply_body=reply_body)  # type: ignore[arg-type]
+
+
+def _reply_with_marker(body: str, fingerprint: str) -> str:
+    return f"{body.strip()}\n\n{_finding_marker(fingerprint)}"
+
+
+def _render_finding_thread_body(finding: ReviewFinding, fingerprint: str) -> str:
+    lines = [
+        f"**Nimble Reviewer** · `{finding.severity.upper()}`",
+        "",
+        f"**{finding.title}**",
+        "",
+        finding.body,
+    ]
+    if finding.suggestion:
+        lines.extend(["", f"Suggested fix: {finding.suggestion}"])
+    lines.extend(["", _finding_marker(fingerprint)])
+    return "\n".join(lines).strip()
+
+
+def _render_thread_reply(finding: ReviewFinding) -> str:
+    lines = [
+        f"**Nimble Reviewer** found a related concern: **{finding.title}**",
+        "",
+        finding.body,
+    ]
+    if finding.suggestion:
+        lines.extend(["", f"Suggested fix: {finding.suggestion}"])
+    return "\n".join(lines).strip()
+
+
+def _finding_marker(fingerprint: str) -> str:
+    return f"{FINDING_MARKER_PREFIX}{fingerprint} -->"
+
+
+def _metrics_from_tracked_findings(tracked_findings: list[TrackedFinding]) -> ReviewSummaryMetrics:
+    open_findings = [item for item in tracked_findings if item.status == "open"]
+    return ReviewSummaryMetrics(
+        open_count=len(open_findings),
+        new_count=0,
+        still_present_count=0,
+        resolved_count=0,
+        dismissed_count=sum(1 for item in tracked_findings if item.status == "dismissed_by_discussion"),
+        unplaced_count=sum(1 for item in open_findings if item.thread_owner == "summary-only"),
+    )
 
 
 def _build_review_comparison(previous: ReviewResult | None, current: ReviewResult) -> ReviewComparison:
@@ -362,14 +785,39 @@ def _build_review_comparison(previous: ReviewResult | None, current: ReviewResul
         matched_previous.add(previous_index)
         current_findings.append(ReviewFindingState(finding=finding, status="still_present"))
 
-    resolved = tuple(
-        finding
-        for index, finding in enumerate(previous.findings)
-        if index not in matched_previous
-    )
-    return ReviewComparison(
-        current_findings=tuple(current_findings),
-        resolved_findings=resolved,
+    resolved = tuple(finding for index, finding in enumerate(previous.findings) if index not in matched_previous)
+    return ReviewComparison(current_findings=tuple(current_findings), resolved_findings=resolved)
+
+
+def _suppress_dismissed_findings(
+    result: ReviewResult,
+    tracked_findings: list[TrackedFinding],
+    diff_mapping: DiffMapping,
+) -> ReviewResult:
+    dismissed = [item for item in tracked_findings if item.status == "dismissed_by_discussion"]
+    if not dismissed:
+        return result
+
+    kept_findings: list[ReviewFinding] = []
+    for finding in result.findings:
+        should_suppress = False
+        for tracked in dismissed:
+            if not findings_match(finding, _tracked_finding_to_review_finding(tracked)):
+                continue
+            if diff_mapping.has_changes_near(tracked.file, tracked.line):
+                break
+            should_suppress = True
+            break
+        if not should_suppress:
+            kept_findings.append(finding)
+
+    return ReviewResult(
+        summary=result.summary,
+        overall_risk=result.overall_risk,
+        findings=tuple(kept_findings),
+        token_usage=result.token_usage,
+        agent_metadata=result.agent_metadata,
+        participants=result.participants,
     )
 
 
@@ -387,6 +835,46 @@ def _enrich_result_for_rendering(result: ReviewResult, checkout_path: Path) -> R
     )
 
 
+def _enrich_finding(finding: ReviewFinding, checkout_path: Path) -> ReviewFinding:
+    snippet = finding.snippet
+    if snippet is None:
+        path = checkout_path / finding.file
+        try:
+            lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
+        except OSError:
+            lines = []
+        if lines:
+            start = max(0, finding.line - 3)
+            end = min(len(lines), finding.line + 2)
+            snippet = "\n".join(lines[start:end])
+    return ReviewFinding(
+        severity=finding.severity,
+        file=finding.file,
+        line=finding.line,
+        title=finding.title,
+        body=finding.body,
+        suggestion=finding.suggestion,
+        sources=finding.sources,
+        opinions=finding.opinions,
+        snippet=snippet,
+        snippet_start_line=max(1, finding.line - 2) if snippet else None,
+        snippet_language=_guess_language(finding.file),
+    )
+
+
+def _guess_language(file_path: str) -> str | None:
+    suffix = Path(file_path).suffix.lower()
+    return {
+        ".py": "python",
+        ".js": "javascript",
+        ".ts": "typescript",
+        ".tsx": "tsx",
+        ".jsx": "jsx",
+        ".rb": "ruby",
+        ".go": "go",
+    }.get(suffix)
+
+
 def _review_result_snapshot_payload(result: ReviewResult) -> dict:
     return {
         "summary": result.summary,
@@ -399,14 +887,13 @@ def _review_result_snapshot_payload(result: ReviewResult) -> dict:
 
 
 def _finding_snapshot_payload(finding: ReviewFinding) -> dict:
-    return {
+    payload = {
         "severity": finding.severity,
         "file": finding.file,
         "line": finding.line,
         "title": finding.title,
         "body": finding.body,
         "suggestion": finding.suggestion,
-        "sources": list(finding.sources),
         "opinions": [
             {
                 "provider": opinion.provider,
@@ -419,169 +906,124 @@ def _finding_snapshot_payload(finding: ReviewFinding) -> dict:
         "snippet_start_line": finding.snippet_start_line,
         "snippet_language": finding.snippet_language,
     }
+    if finding.sources:
+        payload["sources"] = list(finding.sources)
+    return payload
 
 
 def _token_usage_snapshot_payload(token_usage: ReviewTokenUsage | None) -> dict | None:
-    if token_usage is None:
+    if not token_usage:
         return None
     return {
         "input_tokens": token_usage.input_tokens,
         "cached_input_tokens": token_usage.cached_input_tokens,
-        "output_tokens": token_usage.output_tokens,
         "cache_creation_input_tokens": token_usage.cache_creation_input_tokens,
+        "output_tokens": token_usage.output_tokens,
         "cost_usd": token_usage.cost_usd,
         "cached_input_included_in_input": token_usage.cached_input_included_in_input,
         "cache_creation_included_in_input": token_usage.cache_creation_included_in_input,
     }
 
 
-def _review_result_from_snapshot_payload(payload: dict) -> ReviewResult:
-    findings = tuple(_finding_from_snapshot_payload(item) for item in payload.get("findings", []))
-    agent_metadata = payload.get("agent_metadata") or {}
-    participants_payload = payload.get("participants") or []
-    return ReviewResult(
-        summary=str(payload.get("summary", "")),
-        overall_risk=str(payload.get("overall_risk", "low")),
-        findings=findings,
-        token_usage=_token_usage_from_snapshot_payload(payload.get("token_usage")),
-        agent_metadata=(
-            None
-            if not agent_metadata
-            else ReviewAgentMetadata(
-                provider=str(agent_metadata.get("provider", "")),
-                model=agent_metadata.get("model"),
-                reasoning_effort=agent_metadata.get("reasoning_effort"),
-            )
-        ),
-        participants=tuple(_participant_from_snapshot_payload(item) for item in participants_payload),
-    )
-
-
-def _finding_from_snapshot_payload(payload: dict) -> ReviewFinding:
-    return ReviewFinding(
-        severity=str(payload.get("severity", "low")),
-        file=str(payload.get("file", "")),
-        line=int(payload.get("line", 1)),
-        title=str(payload.get("title", "")),
-        body=str(payload.get("body", "")),
-        suggestion=payload.get("suggestion"),
-        sources=tuple(payload.get("sources", ())),
-        opinions=tuple(
-            ReviewOpinion(
-                provider=str(item.get("provider", "")),
-                verdict=str(item.get("verdict", "")),
-                reason=item.get("reason"),
-            )
-            for item in payload.get("opinions", [])
-        ),
-        snippet=payload.get("snippet"),
-        snippet_start_line=payload.get("snippet_start_line"),
-        snippet_language=payload.get("snippet_language"),
-    )
-
-
-def _token_usage_from_snapshot_payload(payload: dict | None) -> ReviewTokenUsage | None:
-    if not payload:
+def _agent_metadata_payload(result: ReviewResult) -> dict | None:
+    if not result.agent_metadata:
         return None
-    return ReviewTokenUsage(
-        input_tokens=int(payload.get("input_tokens", 0)),
-        cached_input_tokens=int(payload.get("cached_input_tokens", 0)),
-        output_tokens=int(payload.get("output_tokens", 0)),
-        cache_creation_input_tokens=int(payload.get("cache_creation_input_tokens", 0)),
-        cost_usd=payload.get("cost_usd"),
-        cached_input_included_in_input=bool(payload.get("cached_input_included_in_input", True)),
-        cache_creation_included_in_input=bool(payload.get("cache_creation_included_in_input", True)),
-    )
-
-
-def _participant_from_snapshot_payload(payload: dict) -> ReviewParticipant:
-    metadata_payload = payload.get("metadata") or payload
-
-    return ReviewParticipant(
-        metadata=ReviewAgentMetadata(
-            provider=str(metadata_payload.get("provider", "")),
-            model=metadata_payload.get("model"),
-            reasoning_effort=metadata_payload.get("reasoning_effort"),
-        ),
-        phases=tuple(payload.get("phases", ())),
-        token_usage=_token_usage_from_snapshot_payload(payload.get("token_usage")),
-        summary=payload.get("summary"),
-        overall_risk=payload.get("overall_risk"),
-    )
-
-
-def _enrich_finding(finding: ReviewFinding, checkout_path: Path) -> ReviewFinding:
-    snippet, snippet_start_line, snippet_language = _build_snippet(checkout_path, finding.file, finding.line)
-    if snippet is None:
-        return finding
-    return ReviewFinding(
-        severity=finding.severity,
-        file=finding.file,
-        line=finding.line,
-        title=finding.title,
-        body=finding.body,
-        suggestion=finding.suggestion,
-        sources=finding.sources,
-        opinions=finding.opinions,
-        snippet=snippet,
-        snippet_start_line=snippet_start_line,
-        snippet_language=snippet_language,
-    )
-
-
-def _build_snippet(checkout_path: Path, relative_file: str, line_number: int) -> tuple[str | None, int | None, str | None]:
-    try:
-        root = checkout_path.resolve()
-        candidate = (checkout_path / relative_file).resolve()
-    except OSError:
-        return None, None, None
-
-    if not _is_within_root(candidate, root) or not candidate.is_file():
-        return None, None, None
-
-    try:
-        content = candidate.read_text(encoding="utf-8", errors="replace").splitlines()
-    except OSError:
-        return None, None, None
-
-    if not content:
-        return None, None, None
-
-    start = max(1, line_number - 2)
-    end = min(len(content), line_number + 2)
-    width = len(str(end))
-    snippet_lines: list[str] = []
-    for current_line in range(start, end + 1):
-        prefix = ">>" if current_line == line_number else "  "
-        snippet_lines.append(f"{prefix}{current_line:>{width}} | {content[current_line - 1]}")
-
-    return "\n".join(snippet_lines), start, _language_for_path(candidate)
-
-
-def _is_within_root(path: Path, root: Path) -> bool:
-    try:
-        path.relative_to(root)
-        return True
-    except ValueError:
-        return False
-
-
-def _language_for_path(path: Path) -> str | None:
-    suffix = path.suffix.lower()
     return {
-        ".py": "python",
-        ".js": "javascript",
-        ".ts": "typescript",
-        ".tsx": "tsx",
-        ".jsx": "jsx",
-        ".java": "java",
-        ".go": "go",
-        ".rb": "ruby",
-        ".rs": "rust",
-        ".sql": "sql",
-        ".sh": "bash",
-        ".yml": "yaml",
-        ".yaml": "yaml",
-        ".json": "json",
-        ".md": "markdown",
-    }.get(suffix, suffix.lstrip(".") or None)
+        "provider": result.agent_metadata.provider,
+        "model": result.agent_metadata.model,
+        "reasoning_effort": result.agent_metadata.reasoning_effort,
+    }
+
+
+def _participants_payload(result: ReviewResult) -> list[dict] | None:
+    if not result.participants:
+        return None
+    return [
+        {
+            "provider": participant.metadata.provider,
+            "model": participant.metadata.model,
+            "reasoning_effort": participant.metadata.reasoning_effort,
+            "phases": list(participant.phases),
+            "token_usage": _token_usage_snapshot_payload(participant.token_usage),
+            "summary": participant.summary,
+            "overall_risk": participant.overall_risk,
+        }
+        for participant in result.participants
+    ]
+
+
+def _review_result_from_snapshot_payload(payload: dict) -> ReviewResult:
+    result = _review_result_from_payload(payload, metadata=None, token_usage=None)
+    token_usage_payload = payload.get("token_usage")
+    token_usage = None
+    if isinstance(token_usage_payload, dict):
+        token_usage = ReviewTokenUsage(
+            input_tokens=int(token_usage_payload.get("input_tokens", 0)),
+            cached_input_tokens=int(token_usage_payload.get("cached_input_tokens", 0)),
+            output_tokens=int(token_usage_payload.get("output_tokens", 0)),
+            cache_creation_input_tokens=int(token_usage_payload.get("cache_creation_input_tokens", 0)),
+            cost_usd=token_usage_payload.get("cost_usd"),
+            cached_input_included_in_input=bool(token_usage_payload.get("cached_input_included_in_input", True)),
+            cache_creation_included_in_input=bool(token_usage_payload.get("cache_creation_included_in_input", True)),
+        )
+    participants = _participants_from_snapshot_payload(payload.get("participants"))
+    metadata = _agent_metadata_from_snapshot_payload(payload.get("agent_metadata"))
+    return ReviewResult(
+        summary=result.summary,
+        overall_risk=result.overall_risk,
+        findings=result.findings,
+        token_usage=token_usage,
+        agent_metadata=metadata,
+        participants=participants,
+    )
+
+
+def _agent_metadata_from_snapshot_payload(payload: dict | None) -> ReviewAgentMetadata | None:
+    if not isinstance(payload, dict):
+        return None
+    provider = str(payload.get("provider", "")).strip().lower()
+    if provider not in {"codex", "claude"}:
+        return None
+    return ReviewAgentMetadata(
+        provider=provider,  # type: ignore[arg-type]
+        model=payload.get("model"),
+        reasoning_effort=payload.get("reasoning_effort"),
+    )
+
+
+def _participants_from_snapshot_payload(payload) -> tuple[ReviewParticipant, ...]:
+    if not isinstance(payload, list):
+        return ()
+    participants: list[ReviewParticipant] = []
+    for item in payload:
+        if not isinstance(item, dict):
+            continue
+        metadata = _agent_metadata_from_snapshot_payload(
+            {
+                "provider": item.get("provider"),
+                "model": item.get("model"),
+                "reasoning_effort": item.get("reasoning_effort"),
+            }
+        )
+        if metadata is None:
+            continue
+        token_usage = None
+        if isinstance(item.get("token_usage"), dict):
+            usage = item["token_usage"]
+            token_usage = ReviewTokenUsage(
+                input_tokens=int(usage.get("input_tokens", 0)),
+                cached_input_tokens=int(usage.get("cached_input_tokens", 0)),
+                output_tokens=int(usage.get("output_tokens", 0)),
+                cache_creation_input_tokens=int(usage.get("cache_creation_input_tokens", 0)),
+                cost_usd=usage.get("cost_usd"),
+            )
+        participants.append(
+            ReviewParticipant(
+                metadata=metadata,
+                phases=tuple(item.get("phases") or ()),
+                token_usage=token_usage,
+                summary=item.get("summary"),
+                overall_risk=item.get("overall_risk"),
+            )
+        )
+    return tuple(participants)

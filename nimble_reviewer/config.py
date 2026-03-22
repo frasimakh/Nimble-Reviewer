@@ -16,6 +16,7 @@ class Settings:
     codex_cmd: tuple[str, ...]
     claude_cmd: tuple[str, ...]
     council_synthesis_provider: ReviewProvider
+    discussion_reconcile_provider: ReviewProvider
     sqlite_path: Path
     repo_cache_dir: Path
     review_trace_dir: Path
@@ -40,6 +41,10 @@ class Settings:
                 default="claude -p --output-format stream-json --model sonnet --effort high --permission-mode bypassPermissions",
             ),
             council_synthesis_provider=_read_review_provider("COUNCIL_SYNTHESIS_PROVIDER", default="codex"),
+            discussion_reconcile_provider=_read_review_provider(
+                "DISCUSSION_RECONCILE_PROVIDER",
+                default=_read_review_provider("COUNCIL_SYNTHESIS_PROVIDER", default="codex"),
+            ),
             sqlite_path=Path(_read_required("SQLITE_PATH")),
             repo_cache_dir=Path(_read_required("REPO_CACHE_DIR")),
             review_trace_dir=Path(os.getenv("REVIEW_TRACE_DIR", "/data/review-traces")),
@@ -70,5 +75,4 @@ def _read_command(env_name: str, default: str | None = None) -> tuple[str, ...]:
     if not value:
         raise RuntimeError(f"Missing required environment variable: {env_name}")
     return tuple(shlex.split(value))
-
 

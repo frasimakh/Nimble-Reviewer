@@ -32,6 +32,52 @@ class StoreTests(unittest.TestCase):
         self.assertEqual(first_run.superseded_by, second.run_id)
         self.assertEqual(second_run.status, "queued")
 
+    def test_discussion_reconcile_is_ignored_when_full_review_pending(self):
+        full_review = self.store.enqueue_run(1, 2, "sha1", None, kind="full_review")
+        decision = self.store.enqueue_run(
+            1,
+            2,
+            "sha1",
+            None,
+            kind="discussion_reconcile",
+            trigger_discussion_id="d1",
+            trigger_note_id=10,
+            trigger_author_id=20,
+        )
+
+        self.assertTrue(full_review.enqueued)
+        self.assertFalse(decision.enqueued)
+        self.assertEqual(decision.reason, "full_review_pending")
+
+    def test_new_discussion_reconcile_supersedes_older_reconcile(self):
+        first = self.store.enqueue_run(
+            1,
+            2,
+            "sha1",
+            None,
+            kind="discussion_reconcile",
+            trigger_discussion_id="d1",
+            trigger_note_id=10,
+            trigger_author_id=20,
+        )
+        claimed = self.store.claim_next_run()
+        self.assertEqual(claimed.kind, "discussion_reconcile")
+        second = self.store.enqueue_run(
+            1,
+            2,
+            "sha1",
+            None,
+            kind="discussion_reconcile",
+            trigger_discussion_id="d2",
+            trigger_note_id=11,
+            trigger_author_id=21,
+        )
+
+        first_run = self.store.get_run(first.run_id)
+        second_run = self.store.get_run(second.run_id)
+        self.assertEqual(first_run.status, "superseded")
+        self.assertEqual(second_run.status, "queued")
+
 
 if __name__ == "__main__":
     unittest.main()
