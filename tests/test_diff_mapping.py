@@ -45,6 +45,31 @@ class DiffMappingTests(unittest.TestCase):
         )
         self.assertIsNone(position)
 
+    def test_maps_added_line_in_new_file_without_dev_null_old_path(self):
+        diff_text = (
+            "diff --git a/src/new_app.py b/src/new_app.py\n"
+            "new file mode 100644\n"
+            "--- /dev/null\n"
+            "+++ b/src/new_app.py\n"
+            "@@ -0,0 +1,2 @@\n"
+            "+line1\n"
+            "+line2\n"
+        )
+        mapping = build_diff_mapping(diff_text)
+
+        position = mapping.to_position(
+            "src/new_app.py",
+            2,
+            GitLabDiffVersion(id=1, base_sha="base", start_sha="start", head_sha="head"),
+        )
+
+        self.assertIsNotNone(position)
+        assert position is not None
+        self.assertEqual(position.old_path, "src/new_app.py")
+        self.assertEqual(position.new_path, "src/new_app.py")
+        self.assertEqual(position.new_line, 2)
+        self.assertIsNone(position.old_line)
+
 
 if __name__ == "__main__":
     unittest.main()

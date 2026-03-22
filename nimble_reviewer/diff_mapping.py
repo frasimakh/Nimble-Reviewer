@@ -76,8 +76,8 @@ def build_diff_mapping(diff_text: str) -> DiffMapping:
         prefix = raw_line[0]
         if prefix == "+":
             anchor = DiffLineAnchor(
-                old_path=current_old_path,
-                new_path=current_new_path,
+                old_path=_discussion_old_path(current_old_path, current_new_path),
+                new_path=_discussion_new_path(current_old_path, current_new_path),
                 old_line=None,
                 new_line=new_line,
             )
@@ -104,3 +104,15 @@ def _normalize_path(value: str) -> str:
     if value.startswith("a/") or value.startswith("b/"):
         return value[2:]
     return value
+
+
+def _discussion_old_path(old_path: str, new_path: str) -> str:
+    if old_path == "/dev/null" and new_path != "/dev/null":
+        return new_path
+    return old_path
+
+
+def _discussion_new_path(old_path: str, new_path: str) -> str:
+    if new_path == "/dev/null" and old_path != "/dev/null":
+        return old_path
+    return new_path

@@ -425,6 +425,19 @@ class DiffPositionPayloadTests(unittest.TestCase):
         self.assertNotIn("new_line", payload)
         self.assertNotIn("old_line", payload)
 
+    def test_normalizes_dev_null_old_path_for_new_file(self):
+        pos = GitLabDiffPosition(
+            base_sha="b",
+            start_sha="s",
+            head_sha="h",
+            old_path="/dev/null",
+            new_path="f.py",
+            new_line=7,
+        )
+        payload = pos.to_api_payload()
+        self.assertEqual(payload["old_path"], "f.py")
+        self.assertEqual(payload["new_path"], "f.py")
+
 
 if __name__ == "__main__":
     unittest.main()

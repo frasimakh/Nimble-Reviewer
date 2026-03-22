@@ -51,13 +51,19 @@ class GitLabDiffPosition:
     new_line: int | None = None
 
     def to_api_payload(self) -> dict[str, Any]:
+        old_path = self.old_path
+        new_path = self.new_path
+        if old_path == "/dev/null" and new_path != "/dev/null":
+            old_path = new_path
+        if new_path == "/dev/null" and old_path != "/dev/null":
+            new_path = old_path
         payload = {
             "position_type": "text",
             "base_sha": self.base_sha,
             "start_sha": self.start_sha,
             "head_sha": self.head_sha,
-            "old_path": self.old_path,
-            "new_path": self.new_path,
+            "old_path": old_path,
+            "new_path": new_path,
         }
         if self.old_line is not None:
             payload["old_line"] = self.old_line
