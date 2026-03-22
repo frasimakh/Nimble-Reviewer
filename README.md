@@ -71,7 +71,6 @@ CLAUDE_CMD=claude -p --output-format stream-json --model sonnet --effort high --
 CODEX_QUOTA_CMD=
 CLAUDE_QUOTA_CMD=
 COUNCIL_SYNTHESIS_PROVIDER=codex
-COUNCIL_SYNTHESIS_CMD=codex exec -m gpt-5.4 -c model_reasoning_effort="low" -
 ```
 
 For Codex, the command should read the prompt from `stdin` and print the final review JSON to `stdout`.
@@ -87,11 +86,13 @@ Optional quota hooks:
 - `CODEX_QUOTA_CMD`
 - `CLAUDE_QUOTA_CMD`
 
-If set, the service runs the command after each base review and expects JSON like:
+If set, the service runs your local command after each base review and expects JSON like:
 
 ```json
 {"remaining_percent": 62.5, "reset_at": "2026-03-22T18:00:00Z"}
 ```
+
+These hooks are non-interactive subprocesses. Do not point them directly at interactive slash commands like `codex /status` or `claude /usage`; wrap those in a script only if you have a stable way to drive and parse the TTY output.
 
 When present, the MR note renders the remaining quota percent and reset timestamp inline for that reviewer.
 
