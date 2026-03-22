@@ -35,6 +35,14 @@ class ReviewAgentError(RuntimeError):
 
 
 class ReviewAgentRunner(Protocol):
+    """Minimal interface shared by all review agent implementations.
+
+    A runner receives a plain-text prompt, executes the underlying CLI in
+    *cwd*, and returns a parsed ``ReviewResult``.  Implementations may run
+    a single provider (``CodexRunner``, ``ClaudeRunner``) or a two-model
+    council (``CouncilRunner``).
+    """
+
     provider_name: str
 
     def review(self, prompt: str, cwd: Path, trace: RunTrace | None = None) -> ReviewResult:
@@ -42,6 +50,13 @@ class ReviewAgentRunner(Protocol):
 
 
 class JsonCapableReviewAgent(ReviewAgentRunner, Protocol):
+    """Extension of ``ReviewAgentRunner`` that can return raw JSON payloads.
+
+    Used by ``CouncilRunner`` to drive both the individual review phase and
+    the synthesis phase with the same runner instances, without re-parsing
+    the JSON twice.
+    """
+
     agent_metadata: ReviewAgentMetadata
 
     def run_json(
@@ -54,6 +69,13 @@ class JsonCapableReviewAgent(ReviewAgentRunner, Protocol):
 
 
 class CodexRunner:
+    """Runs the Codex CLI and parses its JSON event stream into a ``ReviewResult``.
+
+    When *trace* is provided, the runner appends ``--json`` and
+    ``--output-last-message`` flags to capture per-event token usage.  It
+    retries once on JSON parse failure before raising ``ReviewAgentError``.
+    """
+
     provider_name = "codex"
 
     def __init__(self, command: tuple[str, ...], timeout_sec: int) -> None:
@@ -106,6 +128,15 @@ class CodexRunner:
 
 
 class ClaudeRunner:
+    """Runs the Claude CLI and parses its output into a ``ReviewResult``.
+
+    Supports three output formats emitted by the CLI: plain text, ``json``
+    (single envelope), and ``stream-json`` (newline-delimited events).  When
+    *trace* is provided and no explicit ``--output-format`` flag is present,
+    ``stream-json`` is injected so that per-message token usage can be
+    recorded.
+    """
+
     provider_name = "claude"
 
     def __init__(self, command: tuple[str, ...], timeout_sec: int) -> None:
@@ -155,6 +186,18 @@ class ClaudeRunner:
 
 
 class CouncilRunner:
+    """Two-model council: runs Codex and Claude in parallel, then synthesizes.
+
+    Execution flow:
+    1. Codex and Claude reviews run concurrently in a ``ThreadPoolExecutor``.
+    2. If both succeed, a synthesis prompt is sent to *synthesis_provider*
+       (defaults to Codex) with both results as context.
+    3. ``_reconcile_council_findings`` ensures no finding from either base
+       review is silently dropped by the synthesis step.
+    4. If one provider fails, the other's result is used directly (no synthesis).
+    5. If the primary synthesizer fails, the fallback provider is tried once.
+    """
+
     provider_name = "council"
 
     def __init__(
@@ -168,6 +211,7 @@ class CouncilRunner:
         self.synthesis_provider = synthesis_provider
 
     def review(self, prompt: str, cwd: Path, trace: RunTrace | None = None) -> ReviewResult:
+        """Run the full council pipeline and return a merged ``ReviewResult``."""
         provider_runs: list[_ProviderRun] = []
         codex_result, claude_result = self._run_parallel_reviews(prompt, cwd, trace, provider_runs)
 
@@ -419,6 +463,12 @@ def _review_result_from_payload(
     token_usage: ReviewTokenUsage | None,
     require_sources: bool = False,
 ) -> ReviewResult:
+    """Parse a raw agent JSON payload into a ``ReviewResult``.
+
+    *metadata* and *token_usage* are attached directly; when *require_sources*
+    is ``True`` every finding must include a non-empty ``sources`` array (used
+    for synthesis output, which must attribute findings to Codex/Claude).
+    """
     result = _parse_review_result_payload(payload, require_sources=require_sources)
     return ReviewResult(
         summary=result.summary,
@@ -597,6 +647,15 @@ def _reconcile_council_findings(
     codex_result: ReviewResult,
     claude_result: ReviewResult,
 ) -> tuple[ReviewResult, int, int]:
+    """Ensure findings from base reviews are not silently dropped by synthesis.
+
+    For each finding in *codex_result* and *claude_result*:
+    - If a matching finding exists in *final_result*, the provider is added to
+      its ``sources`` and ``opinions`` (attribution update).
+    - If no match is found, the base finding is preserved as-is (preservation).
+
+    Returns ``(reconciled_result, preserved_count, attribution_updates)``.
+    """
     reconciled = list(final_result.findings)
     preserved_count = 0
     attribution_updates = 0
@@ -1078,6 +1137,12 @@ def _build_claude_token_usage(
 
 
 def _load_json_object(raw: str) -> dict:
+    """Extract the first top-level JSON object from *raw*.
+
+    First attempts a direct ``json.loads``; on failure scans for the outermost
+    ``{…}`` block and retries.  Raises ``ReviewAgentError`` if no valid JSON
+    object is found or the top-level type is not a dict.
+    """
     candidate = raw.strip()
     if not candidate:
         raise ReviewAgentError("Empty review agent output")

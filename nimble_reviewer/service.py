@@ -66,6 +66,15 @@ class _StaleRunDuringPublish(RuntimeError):
 
 
 class ReviewService:
+    """Orchestrates the full review lifecycle for a single queued run.
+
+    Handles two run kinds:
+    - ``full_review``: checkout → LLM review → compare vs previous → publish
+      inline discussions + summary note.
+    - ``discussion_reconcile``: re-evaluate an open finding thread after a
+      human reply and decide whether to dismiss, reply, or keep open.
+    """
+
     def __init__(self, deps: ServiceDependencies) -> None:
         self.store = deps.store
         self.gitlab = deps.gitlab
@@ -75,6 +84,11 @@ class ReviewService:
         self.trace_settings = deps.trace_settings
 
     def process_run(self, run: ReviewRun) -> None:
+        """Dispatch *run* to the appropriate handler based on ``run.kind``.
+
+        Exits immediately if the run is no longer in ``running`` state (e.g.
+        superseded by a newer push before the worker claimed it).
+        """
         if self.store.get_run_status(run.id) != "running":
             LOGGER.info("Skipping run %s because it is no longer running", run.id)
             return
@@ -84,6 +98,13 @@ class ReviewService:
         self._process_full_review_run(run)
 
     def _process_full_review_run(self, run: ReviewRun) -> None:
+        """Execute a full MR review: checkout → review → publish.
+
+        Checks staleness twice — once before the expensive LLM call and once
+        immediately before publishing — and aborts with ``superseded`` if the
+        MR head has moved on either check.  On any unhandled error the run is
+        marked ``failed`` and a failure note is posted to the MR.
+        """
         LOGGER.info(
             "Starting full review run_id=%s project=%s mr=%s sha=%s",
             run.id,
@@ -207,6 +228,13 @@ class ReviewService:
                 LOGGER.exception("Failed to publish failure note for run %s", run.id)
 
     def _process_discussion_reconcile_run(self, run: ReviewRun) -> None:
+        """Handle a follow-up review triggered by a human reply in a thread.
+
+        Looks up the tracked finding linked to *run.trigger_discussion_id*,
+        asks the reconcile agent for a decision, then either dismisses the
+        finding, adds a bot reply, or leaves it open.  The summary note is
+        refreshed to reflect any status change.
+        """
         LOGGER.info(
             "Starting discussion reconcile run_id=%s project=%s mr=%s discussion=%s note=%s",
             run.id,
@@ -298,6 +326,20 @@ class ReviewService:
         diff_mapping: DiffMapping,
         latest_version,
     ) -> _PublishedReviewState:
+        """Place each finding into a GitLab discussion thread and update the store.
+
+        For each finding in *result*:
+        1. Re-uses an existing tracked thread when the fingerprint matches.
+        2. Appends to an existing human thread when the file/line is close.
+        3. Creates a new inline diff discussion via the GitLab API.
+        4. Falls back to ``summary-only`` placement when no diff position is
+           available or inline creation fails because the MR head is stable.
+
+        Raises ``_StaleRunDuringPublish`` if the MR head changes mid-publish
+        (caller marks the run superseded and aborts without posting a note).
+        Also resolves any bot-owned threads whose findings no longer appear in
+        *result*.
+        """
         bot_user_id = self.gitlab.get_current_user().id
         discussions_by_id = {discussion.id: discussion for discussion in discussions}
         used_tracked: set[str] = set()
@@ -483,6 +525,14 @@ class ReviewService:
         fingerprint: str,
         position,
     ) -> GitLabDiscussion | None:
+        """Attempt to post an inline diff discussion, with stale-check on failure.
+
+        Returns the created ``GitLabDiscussion`` on success, or ``None`` when
+        the GitLab API rejects the position but the MR head has not changed
+        (safe to degrade to summary-only).  Raises ``_StaleRunDuringPublish``
+        if the API error coincides with the MR head advancing, so the caller
+        can abort the entire publish without posting a partial note.
+        """
         try:
             return self.gitlab.create_diff_discussion(
                 project_id,
