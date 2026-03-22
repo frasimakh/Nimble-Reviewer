@@ -68,6 +68,8 @@ Default command behavior:
 ```env
 CODEX_CMD=codex exec -m gpt-5.4 -c model_reasoning_effort="high" -
 CLAUDE_CMD=claude -p --output-format stream-json --model sonnet --effort high --permission-mode bypassPermissions
+CODEX_QUOTA_CMD=
+CLAUDE_QUOTA_CMD=
 COUNCIL_SYNTHESIS_PROVIDER=codex
 COUNCIL_SYNTHESIS_CMD=codex exec -m gpt-5.4 -c model_reasoning_effort="low" -
 ```
@@ -79,6 +81,19 @@ For Claude Code, the service supports:
 - plain text mode where Claude prints the final review JSON directly
 - `--output-format json`, where Claude wraps the final review text in a JSON envelope and the service extracts the `result` field
 - `--output-format stream-json`, where the service records Claude provider events into the persisted run trace and extracts the final `result` event
+
+Optional quota hooks:
+
+- `CODEX_QUOTA_CMD`
+- `CLAUDE_QUOTA_CMD`
+
+If set, the service runs the command after each base review and expects JSON like:
+
+```json
+{"remaining_percent": 62.5, "reset_at": "2026-03-22T18:00:00Z"}
+```
+
+When present, the MR note renders the remaining quota percent and reset timestamp inline for that reviewer.
 
 ## Review trace
 
@@ -108,6 +123,7 @@ The MR note stays intentionally short. It includes:
 
 - council participants
 - model and reasoning effort for each participant
+- remaining quota percent and reset timestamp when a quota hook provides them
 - token usage when available
 - Claude `cost_usd` when available
 - per-finding model attribution: `codex`, `claude`, or `both`

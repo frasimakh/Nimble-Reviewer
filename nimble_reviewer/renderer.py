@@ -136,7 +136,11 @@ def _render_summary_with_council(result: ReviewResult, findings, comparison: Rev
         label = _provider_label(participant.metadata.provider)
         meta = _participant_meta_inline(participant)
         risk = _participant_risk_inline(participant)
-        lines.extend([f"**{label}** · {risk} · {meta}"])
+        quota = _participant_quota_inline(participant)
+        line = f"**{label}** · {risk} · {meta}"
+        if quota:
+            line = f"{line} · {quota}"
+        lines.extend([line])
         if participant.summary:
             lines.extend([f"> {participant.summary}", ""])
         else:
@@ -174,6 +178,18 @@ def _participant_meta_inline(participant: ReviewParticipant) -> str:
 def _participant_risk_inline(participant: ReviewParticipant) -> str:
     risk = (participant.overall_risk or "unknown").upper()
     return f"risk **{risk}**"
+
+
+def _participant_quota_inline(participant: ReviewParticipant) -> str | None:
+    quota_status = participant.quota_status
+    if quota_status is None:
+        return None
+    parts: list[str] = []
+    if quota_status.remaining_percent is not None:
+        parts.append(f"quota `{quota_status.remaining_percent:.1f}% left`")
+    if quota_status.reset_at:
+        parts.append(f"reset `{quota_status.reset_at}`")
+    return " · ".join(parts) if parts else None
 
 
 def _default_review_comparison(result: ReviewResult) -> ReviewComparison:
@@ -262,6 +278,5 @@ def _provider_label(provider: str) -> str:
         "codex": "Codex",
         "claude": "Claude",
     }.get(provider, provider.capitalize())
-
 
 

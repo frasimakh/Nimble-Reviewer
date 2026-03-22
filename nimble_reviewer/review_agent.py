@@ -17,6 +17,7 @@ from nimble_reviewer.models import (
     ReviewOpinion,
     ReviewParticipant,
     ReviewProvider,
+    ReviewQuotaStatus,
     ReviewResult,
     ReviewTokenUsage,
 )
@@ -56,14 +57,21 @@ class JsonCapableReviewAgent(ReviewAgentRunner, Protocol):
 class CodexRunner:
     provider_name = "codex"
 
-    def __init__(self, command: tuple[str, ...], timeout_sec: int) -> None:
+    def __init__(
+        self,
+        command: tuple[str, ...],
+        timeout_sec: int,
+        quota_command: tuple[str, ...] | None = None,
+    ) -> None:
         self.command = command
         self.timeout_sec = timeout_sec
+        self.quota_command = quota_command
         self.agent_metadata = _extract_agent_metadata(self.provider_name, command)
 
     def review(self, prompt: str, cwd: Path, trace: RunTrace | None = None) -> ReviewResult:
         payload, usage = self.run_json(prompt, cwd, trace=trace)
-        return _review_result_from_payload(payload, self.agent_metadata, usage)
+        quota_status = _probe_quota_status(self.provider_name, self.quota_command, cwd, trace)
+        return _review_result_from_payload(payload, self.agent_metadata, usage, quota_status=quota_status)
 
     def run_json(
         self,
@@ -108,14 +116,21 @@ class CodexRunner:
 class ClaudeRunner:
     provider_name = "claude"
 
-    def __init__(self, command: tuple[str, ...], timeout_sec: int) -> None:
+    def __init__(
+        self,
+        command: tuple[str, ...],
+        timeout_sec: int,
+        quota_command: tuple[str, ...] | None = None,
+    ) -> None:
         self.command = command
         self.timeout_sec = timeout_sec
+        self.quota_command = quota_command
         self.agent_metadata = _extract_agent_metadata(self.provider_name, command)
 
     def review(self, prompt: str, cwd: Path, trace: RunTrace | None = None) -> ReviewResult:
         payload, usage = self.run_json(prompt, cwd, trace=trace)
-        return _review_result_from_payload(payload, self.agent_metadata, usage)
+        quota_status = _probe_quota_status(self.provider_name, self.quota_command, cwd, trace)
+        return _review_result_from_payload(payload, self.agent_metadata, usage, quota_status=quota_status)
 
     def run_json(
         self,
@@ -248,6 +263,7 @@ class CouncilRunner:
             summary=final_result.summary,
             overall_risk=final_result.overall_risk,
             findings=final_result.findings,
+            quota_status=final_result.quota_status,
             participants=participants,
         )
 
@@ -309,6 +325,7 @@ class CouncilRunner:
                         phase="review",
                         metadata=result.agent_metadata or ReviewAgentMetadata(provider=provider),  # type: ignore[arg-type]
                         token_usage=result.token_usage,
+                        quota_status=result.quota_status,
                         summary=result.summary or None,
                         overall_risk=result.overall_risk,
                     )
@@ -323,6 +340,7 @@ class _ProviderRun:
     phase: str
     metadata: ReviewAgentMetadata
     token_usage: ReviewTokenUsage | None
+    quota_status: ReviewQuotaStatus | None = None
     summary: str | None = None
     overall_risk: str | None = None
 
@@ -331,6 +349,7 @@ def _review_result_from_payload(
     payload: dict,
     metadata: ReviewAgentMetadata | None,
     token_usage: ReviewTokenUsage | None,
+    quota_status: ReviewQuotaStatus | None = None,
     require_sources: bool = False,
 ) -> ReviewResult:
     result = _parse_review_result_payload(payload, require_sources=require_sources)
@@ -339,6 +358,7 @@ def _review_result_from_payload(
         overall_risk=result.overall_risk,
         findings=result.findings,
         token_usage=token_usage or result.token_usage,
+        quota_status=quota_status or result.quota_status,
         agent_metadata=metadata,
     )
 
@@ -374,6 +394,7 @@ def _review_result_to_payload(result: ReviewResult) -> dict:
             for finding in result.findings
         ],
         **({"token_usage": _token_usage_to_payload(result.token_usage)} if result.token_usage else {}),
+        **({"quota_status": _quota_status_to_payload(result.quota_status)} if result.quota_status else {}),
         **(
             {
                 "agent_metadata": {
@@ -641,6 +662,7 @@ def _summarize_participants(
         current = summaries.get(key)
         phases = tuple(dict.fromkeys((*(current.phases if current else ()), run.phase)))
         usage = _merge_token_usage(current.token_usage if current else None, run.token_usage)
+        quota_status = run.quota_status or (current.quota_status if current else None)
         summary = reviewer_overview.get(run.provider) if run.phase == "review" else None
         if not summary:
             summary = (current.summary if current else None) or run.summary or None
@@ -649,6 +671,7 @@ def _summarize_participants(
             metadata=run.metadata,
             phases=phases,
             token_usage=usage,
+            quota_status=quota_status,
             summary=summary,
             overall_risk=overall_risk,
         )
@@ -695,6 +718,89 @@ def _token_usage_to_payload(token_usage: ReviewTokenUsage | None) -> dict | None
         "total_tokens": token_usage.total_tokens,
         "cost_usd": token_usage.cost_usd,
     }
+
+
+def _quota_status_to_payload(quota_status: ReviewQuotaStatus | None) -> dict | None:
+    if quota_status is None:
+        return None
+    return {
+        "remaining_percent": quota_status.remaining_percent,
+        "reset_at": quota_status.reset_at,
+    }
+
+
+def _probe_quota_status(
+    provider_name: str,
+    command: tuple[str, ...] | None,
+    cwd: Path,
+    trace: RunTrace | None,
+) -> ReviewQuotaStatus | None:
+    if not command:
+        return None
+    try:
+        completed = subprocess.run(
+            list(command),
+            text=True,
+            capture_output=True,
+            cwd=cwd,
+            timeout=10,
+            check=False,
+        )
+    except subprocess.TimeoutExpired:
+        LOGGER.warning("%s quota command timed out after 10s", provider_name)
+        if trace:
+            trace.write("provider", f"{provider_name}.quota.timeout")
+        return None
+
+    if completed.returncode != 0:
+        LOGGER.warning(
+            "%s quota command failed exit=%s stderr=%s",
+            provider_name,
+            completed.returncode,
+            completed.stderr.strip(),
+        )
+        if trace:
+            trace.write(
+                "provider",
+                f"{provider_name}.quota.failed",
+                exit_code=completed.returncode,
+                stderr=completed.stderr.strip(),
+            )
+        return None
+
+    raw = completed.stdout.strip()
+    if not raw:
+        return None
+    try:
+        payload = json.loads(raw)
+    except json.JSONDecodeError:
+        LOGGER.warning("%s quota command returned invalid JSON", provider_name)
+        if trace:
+            trace.write("provider", f"{provider_name}.quota.invalid_json", raw=raw)
+        return None
+
+    quota_status = _parse_quota_status_payload(payload)
+    if quota_status and trace:
+        trace.write("provider", f"{provider_name}.quota", payload=_quota_status_to_payload(quota_status))
+    return quota_status
+
+
+def _parse_quota_status_payload(payload: dict) -> ReviewQuotaStatus | None:
+    if not isinstance(payload, dict):
+        return None
+    remaining_percent = payload.get("remaining_percent")
+    reset_at = payload.get("reset_at")
+    if remaining_percent is None and not reset_at:
+        return None
+    try:
+        remaining = None if remaining_percent is None else float(remaining_percent)
+    except (TypeError, ValueError):
+        remaining = None
+    reset_value = None if reset_at is None else str(reset_at).strip() or None
+    return ReviewQuotaStatus(
+        remaining_percent=remaining,
+        reset_at=reset_value,
+    )
 
 
 def _run_command(

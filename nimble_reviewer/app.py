@@ -144,8 +144,8 @@ def _configure_logging() -> None:
 
 
 def _build_review_agent(settings: Settings):
-    codex_runner = CodexRunner(settings.codex_cmd, settings.review_timeout_sec)
-    claude_runner = ClaudeRunner(settings.claude_cmd, settings.review_timeout_sec)
+    codex_runner = CodexRunner(settings.codex_cmd, settings.review_timeout_sec, quota_command=settings.codex_quota_cmd)
+    claude_runner = ClaudeRunner(settings.claude_cmd, settings.review_timeout_sec, quota_command=settings.claude_quota_cmd)
     synthesis_runner = (
         CodexRunner(settings.council_synthesis_cmd, settings.review_timeout_sec)
         if settings.council_synthesis_provider == "codex"
