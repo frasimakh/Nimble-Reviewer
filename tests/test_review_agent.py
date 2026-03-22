@@ -238,6 +238,10 @@ class ReviewAgentTests(unittest.TestCase):
                     {
                         "summary": "One shared actionable issue.",
                         "overall_risk": "medium",
+                        "reviewer_overview": {
+                            "codex": "Codex highlighted the missing null guard.",
+                            "claude": "Claude confirmed the missing guard path.",
+                        },
                         "findings": [
                             {
                                 "severity": "medium",
@@ -272,11 +276,15 @@ class ReviewAgentTests(unittest.TestCase):
         self.assertEqual(len(result.findings[0].opinions), 2)
         self.assertEqual(len(result.participants), 3)
         self.assertEqual(result.participants[0].phases, ("review",))
+        self.assertEqual(result.participants[0].overall_risk, "medium")
+        self.assertEqual(result.participants[0].summary, "Codex highlighted the missing null guard.")
         self.assertEqual(result.participants[1].metadata.provider, "codex")
         self.assertEqual(result.participants[1].metadata.reasoning_effort, "low")
         self.assertEqual(result.participants[1].phases, ("synthesis",))
         self.assertEqual(result.participants[2].metadata.provider, "claude")
         self.assertEqual(result.participants[2].phases, ("review",))
+        self.assertEqual(result.participants[2].overall_risk, "medium")
+        self.assertEqual(result.participants[2].summary, "Claude confirmed the missing guard path.")
 
     def test_council_runner_writes_stage_snapshots(self):
         from pathlib import Path

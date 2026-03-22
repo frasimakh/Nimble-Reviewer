@@ -26,6 +26,7 @@ from nimble_reviewer.trace import RunTrace
 VALID_SEVERITIES = {"high", "medium", "low"}
 VALID_PROVIDERS = {"codex", "claude"}
 VALID_OPINION_VERDICTS = {"found", "agree", "disagree", "uncertain"}
+VALID_REVIEWER_OVERVIEW_KEYS = {"codex", "claude"}
 LOGGER = logging.getLogger(__name__)
 
 
@@ -189,6 +190,7 @@ class CouncilRunner:
         )
         synthesis_started = time.monotonic()
         synthesis_payload, synthesis_usage = self.synthesizer.run_json(synthesis_prompt, cwd, trace=trace)
+        reviewer_overview = _parse_reviewer_overview_payload(synthesis_payload.get("reviewer_overview"))
         if trace:
             trace.write_snapshot(f"{self.synthesizer.provider_name}.synthesis", synthesis_payload)
         provider_runs.append(
@@ -198,6 +200,7 @@ class CouncilRunner:
                 metadata=self.synthesizer.agent_metadata,
                 token_usage=synthesis_usage,
                 summary=str(synthesis_payload.get("summary", "")).strip() or None,
+                overall_risk=str(synthesis_payload.get("overall_risk", "")).strip().lower() or None,
             )
         )
         final_result = _review_result_from_payload(
@@ -211,7 +214,7 @@ class CouncilRunner:
             codex_result=codex_result,
             claude_result=claude_result,
         )
-        participants = _summarize_participants(provider_runs)
+        participants = _summarize_participants(provider_runs, reviewer_overview=reviewer_overview)
         if trace:
             trace.write(
                 "council",
@@ -307,6 +310,7 @@ class CouncilRunner:
                         metadata=result.agent_metadata or ReviewAgentMetadata(provider=provider),  # type: ignore[arg-type]
                         token_usage=result.token_usage,
                         summary=result.summary or None,
+                        overall_risk=result.overall_risk,
                     )
                 )
                 results[provider] = (result, provider_runs[-1])
@@ -320,6 +324,7 @@ class _ProviderRun:
     metadata: ReviewAgentMetadata
     token_usage: ReviewTokenUsage | None
     summary: str | None = None
+    overall_risk: str | None = None
 
 
 def _review_result_from_payload(
@@ -483,6 +488,24 @@ def _parse_finding_opinions(value) -> tuple[ReviewOpinion, ...]:
     return tuple(opinions)
 
 
+def _parse_reviewer_overview_payload(value) -> dict[ReviewProvider, str]:
+    if value is None:
+        return {}
+    if not isinstance(value, dict):
+        raise ReviewAgentError("reviewer_overview must be an object when provided")
+
+    overview: dict[ReviewProvider, str] = {}
+    for provider, text_value in value.items():
+        normalized_provider = str(provider).strip().lower()
+        if normalized_provider not in VALID_REVIEWER_OVERVIEW_KEYS:
+            raise ReviewAgentError(f"Invalid reviewer_overview key: {provider!r}")
+        summary = str(text_value).strip()
+        if not summary:
+            raise ReviewAgentError(f"reviewer_overview[{provider!r}] must be a non-empty string")
+        overview[normalized_provider] = summary  # type: ignore[assignment]
+    return overview
+
+
 def _reconcile_council_findings(
     final_result: ReviewResult,
     codex_result: ReviewResult,
@@ -607,19 +630,27 @@ def _highest_severity(initial: str, *values: str) -> str:
     return best
 
 
-def _summarize_participants(runs: list[_ProviderRun]) -> tuple[ReviewParticipant, ...]:
+def _summarize_participants(
+    runs: list[_ProviderRun],
+    reviewer_overview: dict[ReviewProvider, str] | None = None,
+) -> tuple[ReviewParticipant, ...]:
     summaries: dict[tuple[str, str | None, str | None], ReviewParticipant] = {}
+    reviewer_overview = reviewer_overview or {}
     for run in runs:
         key = (run.provider, run.metadata.model, run.metadata.reasoning_effort)
         current = summaries.get(key)
         phases = tuple(dict.fromkeys((*(current.phases if current else ()), run.phase)))
         usage = _merge_token_usage(current.token_usage if current else None, run.token_usage)
-        summary = (current.summary if current else None) or run.summary or None
+        summary = reviewer_overview.get(run.provider) if run.phase == "review" else None
+        if not summary:
+            summary = (current.summary if current else None) or run.summary or None
+        overall_risk = (current.overall_risk if current else None) or run.overall_risk
         summaries[key] = ReviewParticipant(
             metadata=run.metadata,
             phases=phases,
             token_usage=usage,
             summary=summary,
+            overall_risk=overall_risk,
         )
     return tuple(
         participant

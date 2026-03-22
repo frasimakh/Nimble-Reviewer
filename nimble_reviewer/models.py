@@ -66,6 +66,7 @@ class ReviewParticipant:
     phases: tuple[str, ...] = field(default_factory=tuple)
     token_usage: ReviewTokenUsage | None = None
     summary: str | None = None
+    overall_risk: Severity | None = None
 
 
 @dataclass(frozen=True)
