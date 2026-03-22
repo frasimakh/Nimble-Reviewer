@@ -246,6 +246,58 @@ class ReviewServiceTests(unittest.TestCase):
         self.assertEqual(tracked[0].thread_owner, "summary-only")
         self.assertIn("`1 unplaced`", gitlab.summary_note.body)
 
+    def test_full_review_retries_summary_only_finding_as_inline_on_next_sha(self):
+        workspace = Path(self.tmpdir.name)
+        (workspace / "file.py").write_text("new line\nsecond line\n", encoding="utf-8")
+        gitlab = FakeGitLabClient()
+        failing_service = self._service(
+            gitlab,
+            FakeRepoManager(workspace),
+            FakeReviewAgentRunner(
+                result=ReviewResult(
+                    summary="One issue found.",
+                    overall_risk="medium",
+                    findings=(ReviewFinding("medium", "file.py", 1, "Bug", "Needs fixing"),),
+                )
+            ),
+        )
+        gitlab.raise_on_create_diff_discussion = True
+        self.store.enqueue_run(1, 2, "sha1", None)
+        first_run = self.store.claim_next_run()
+        failing_service.process_run(first_run)
+
+        gitlab.raise_on_create_diff_discussion = False
+        gitlab.mr_info = MergeRequestInfo(
+            project_id=1,
+            mr_iid=2,
+            title="Title",
+            description="Description",
+            source_branch="feature",
+            target_branch="main",
+            source_sha="sha2",
+            web_url=gitlab.mr_info.web_url,
+            repo_http_url=gitlab.mr_info.repo_http_url,
+        )
+        retry_service = self._service(
+            gitlab,
+            FakeRepoManager(workspace),
+            FakeReviewAgentRunner(
+                result=ReviewResult(
+                    summary="One issue found.",
+                    overall_risk="medium",
+                    findings=(ReviewFinding("medium", "file.py", 1, "Bug", "Needs fixing"),),
+                )
+            ),
+        )
+        self.store.enqueue_run(1, 2, "sha2", None)
+        second_run = self.store.claim_next_run()
+        retry_service.process_run(second_run)
+
+        tracked = self.store.list_tracked_findings(1, 2)
+        self.assertEqual(len(gitlab.discussions), 1)
+        self.assertEqual(tracked[0].thread_owner, "bot")
+        self.assertIn("`0 unplaced`", gitlab.summary_note.body)
+
     def test_full_review_is_superseded_when_inline_publish_fails_after_head_changes(self):
         workspace = Path(self.tmpdir.name)
         (workspace / "file.py").write_text("new line\nsecond line\n", encoding="utf-8")
@@ -494,6 +546,48 @@ class ReviewServiceTests(unittest.TestCase):
         self.assertEqual(updated.status, "open")
         self.assertFalse(gitlab.discussions[0].resolved)
         self.assertIn("I still see a risk here", gitlab.discussions[0].notes[-1].body)
+
+    def test_full_review_does_not_attach_to_nearby_human_discussion_on_different_line(self):
+        workspace = Path(self.tmpdir.name)
+        (workspace / "file.py").write_text("new line\nsecond line\n", encoding="utf-8")
+        gitlab = FakeGitLabClient()
+        gitlab.discussions.append(
+            GitLabDiscussion(
+                id="human-1",
+                individual_note=False,
+                notes=(GitLabNote(id=700, body="Please rename this variable.", author_id=123),),
+                resolved=False,
+                resolvable=True,
+                position=GitLabDiffPosition(
+                    base_sha="base",
+                    start_sha="start",
+                    head_sha="sha1",
+                    old_path="file.py",
+                    new_path="file.py",
+                    new_line=2,
+                ),
+            )
+        )
+        service = self._service(
+            gitlab,
+            FakeRepoManager(workspace),
+            FakeReviewAgentRunner(
+                result=ReviewResult(
+                    summary="One issue found.",
+                    overall_risk="medium",
+                    findings=(ReviewFinding("medium", "file.py", 1, "Bug", "Needs fixing"),),
+                )
+            ),
+        )
+
+        self.store.enqueue_run(1, 2, "sha1", None)
+        run = self.store.claim_next_run()
+        service.process_run(run)
+
+        self.assertEqual(len(gitlab.discussions), 2)
+        self.assertEqual(gitlab.discussions[0].id, "human-1")
+        self.assertEqual(len(gitlab.discussions[0].notes), 1)
+        self.assertEqual(gitlab.discussions[1].root_note.author_id, gitlab.current_user.id)
 
 
 if __name__ == "__main__":

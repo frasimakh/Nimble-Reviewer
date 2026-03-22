@@ -368,20 +368,25 @@ class ReviewService:
                     thread_owner = tracked.thread_owner
                     if tracked.thread_owner == "bot" and discussion.resolved:
                         self.gitlab.set_discussion_resolved(project_id, mr_iid, discussion.id, resolved=False)
-                elif tracked.thread_owner == "summary-only":
-                    tracked = None
+            if tracked and tracked.thread_owner == "summary-only":
+                tracked = None
 
             if tracked is None:
-                human_discussion = _find_relevant_human_discussion(finding, discussions, bot_user_id=bot_user_id)
-                if human_discussion is not None:
-                    self.gitlab.add_discussion_note(
-                        project_id,
-                        mr_iid,
-                        human_discussion.id,
-                        _reply_with_marker(_render_thread_reply(finding), fp),
+                position = diff_mapping.to_position(finding.file, finding.line, latest_version)
+                created_discussion = None
+                if position is not None:
+                    created_discussion = self._create_inline_discussion_or_none(
+                        run_id=run_id,
+                        project_id=project_id,
+                        mr_iid=mr_iid,
+                        source_sha=source_sha,
+                        finding=finding,
+                        fingerprint=fp,
+                        position=position,
                     )
-                    discussion_id = human_discussion.id
-                    thread_owner = "human"
+                if created_discussion is not None:
+                    discussion_id = created_discussion.id
+                    thread_owner = "bot"
                     placement = "inline"
                     tracked = TrackedFinding(
                         project_id=project_id,
@@ -395,68 +400,32 @@ class ReviewService:
                         body=finding.body,
                         suggestion=finding.suggestion,
                         sources=finding.sources,
-                        discussion_id=human_discussion.id,
-                        root_note_id=human_discussion.root_note.id if human_discussion.root_note else None,
-                        thread_owner="human",
+                        discussion_id=created_discussion.id,
+                        root_note_id=created_discussion.root_note.id if created_discussion.root_note else None,
+                        thread_owner="bot",
                         opened_sha=source_sha,
                         last_seen_sha=source_sha,
                         context_snippet=finding.snippet,
                     )
                 else:
-                    position = diff_mapping.to_position(finding.file, finding.line, latest_version)
-                    created_discussion = None
-                    if position is not None:
-                        created_discussion = self._create_inline_discussion_or_none(
-                            run_id=run_id,
-                            project_id=project_id,
-                            mr_iid=mr_iid,
-                            source_sha=source_sha,
-                            finding=finding,
-                            fingerprint=fp,
-                            position=position,
-                        )
-                    if created_discussion is not None:
-                        discussion_id = created_discussion.id
-                        thread_owner = "bot"
-                        placement = "inline"
-                        tracked = TrackedFinding(
-                            project_id=project_id,
-                            mr_iid=mr_iid,
-                            fingerprint=fp,
-                            status="open",
-                            severity=finding.severity,
-                            file=finding.file,
-                            line=finding.line,
-                            title=finding.title,
-                            body=finding.body,
-                            suggestion=finding.suggestion,
-                            sources=finding.sources,
-                            discussion_id=created_discussion.id,
-                            root_note_id=created_discussion.root_note.id if created_discussion.root_note else None,
-                            thread_owner="bot",
-                            opened_sha=source_sha,
-                            last_seen_sha=source_sha,
-                            context_snippet=finding.snippet,
-                        )
-                    else:
-                        tracked = TrackedFinding(
-                            project_id=project_id,
-                            mr_iid=mr_iid,
-                            fingerprint=fp,
-                            status="open",
-                            severity=finding.severity,
-                            file=finding.file,
-                            line=finding.line,
-                            title=finding.title,
-                            body=finding.body,
-                            suggestion=finding.suggestion,
-                            sources=finding.sources,
-                            thread_owner="summary-only",
-                            opened_sha=source_sha,
-                            last_seen_sha=source_sha,
-                            context_snippet=finding.snippet,
-                        )
-                        unplaced_findings.append(finding)
+                    tracked = TrackedFinding(
+                        project_id=project_id,
+                        mr_iid=mr_iid,
+                        fingerprint=fp,
+                        status="open",
+                        severity=finding.severity,
+                        file=finding.file,
+                        line=finding.line,
+                        title=finding.title,
+                        body=finding.body,
+                        suggestion=finding.suggestion,
+                        sources=finding.sources,
+                        thread_owner="summary-only",
+                        opened_sha=source_sha,
+                        last_seen_sha=source_sha,
+                        context_snippet=finding.snippet,
+                    )
+                    unplaced_findings.append(finding)
 
             tracked = dc_replace(
                 tracked,
@@ -712,32 +681,6 @@ def _tracked_finding_to_review_finding(item: TrackedFinding) -> ReviewFinding:
         sources=item.sources,
         snippet=item.context_snippet,
     )
-
-
-def _find_relevant_human_discussion(
-    finding: ReviewFinding,
-    discussions: list[GitLabDiscussion],
-    *,
-    bot_user_id: int,
-) -> GitLabDiscussion | None:
-    for discussion in discussions:
-        if discussion.root_note and discussion.root_note.author_id == bot_user_id:
-            continue
-        if discussion.position and discussion.position.new_path == finding.file:
-            line = discussion.position.new_line or discussion.position.old_line or 0
-            if abs(line - finding.line) <= 3:
-                return discussion
-        discussion_text = " ".join(note.body for note in discussion.notes)
-        synthetic = ReviewFinding(
-            severity=finding.severity,
-            file=discussion.position.new_path if discussion.position else finding.file,
-            line=discussion.position.new_line or discussion.position.old_line or finding.line if discussion.position else finding.line,
-            title=discussion.root_note.body[:80] if discussion.root_note else finding.title,
-            body=discussion_text or finding.body,
-        )
-        if findings_match(finding, synthetic):
-            return discussion
-    return None
 
 
 def _find_discussion(
