@@ -61,10 +61,17 @@ class ReviewAgentMetadata:
 
 
 @dataclass(frozen=True)
+class ReviewQuotaStatus:
+    remaining_percent: float | None = None
+    reset_at: str | None = None
+
+
+@dataclass(frozen=True)
 class ReviewParticipant:
     metadata: ReviewAgentMetadata
     phases: tuple[str, ...] = field(default_factory=tuple)
     token_usage: ReviewTokenUsage | None = None
+    quota_status: ReviewQuotaStatus | None = None
     summary: str | None = None
     overall_risk: Severity | None = None
 
@@ -75,6 +82,7 @@ class ReviewResult:
     overall_risk: Severity
     findings: tuple[ReviewFinding, ...] = field(default_factory=tuple)
     token_usage: ReviewTokenUsage | None = None
+    quota_status: ReviewQuotaStatus | None = None
     agent_metadata: ReviewAgentMetadata | None = None
     participants: tuple[ReviewParticipant, ...] = field(default_factory=tuple)
 

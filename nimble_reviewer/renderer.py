@@ -136,7 +136,11 @@ def _render_summary_with_council(result: ReviewResult, findings, comparison: Rev
         label = _provider_label(participant.metadata.provider)
         meta = _participant_meta_inline(participant)
         risk = _participant_risk_inline(participant)
-        lines.extend([f"**{label}** · {risk} · {meta}"])
+        quota = _participant_quota_inline(participant)
+        line = f"**{label}** · {risk} · {meta}"
+        if quota:
+            line = f"{line} · {quota}"
+        lines.extend([line])
         if participant.summary:
             lines.extend([f"> {participant.summary}", ""])
         else:
@@ -174,6 +178,39 @@ def _participant_meta_inline(participant: ReviewParticipant) -> str:
 def _participant_risk_inline(participant: ReviewParticipant) -> str:
     risk = (participant.overall_risk or "unknown").upper()
     return f"risk **{risk}**"
+
+
+def _participant_quota_inline(participant: ReviewParticipant) -> str | None:
+    quota_status = participant.quota_status
+    if quota_status is None:
+        return None
+    parts: list[str] = []
+    if quota_status.remaining_percent is not None:
+        parts.append(f"quota `{_format_quota_percent(quota_status.remaining_percent)} left`")
+    if quota_status.reset_at:
+        parts.append(f"reset `{_format_quota_reset_at(quota_status.reset_at)}`")
+    return " · ".join(parts) if parts else None
+
+
+def _format_quota_percent(value: float) -> str:
+    rounded = round(value, 1)
+    if rounded.is_integer():
+        return f"{int(rounded)}%"
+    return f"{rounded:.1f}%"
+
+
+def _format_quota_reset_at(value: str) -> str:
+    raw = value.strip()
+    if not raw:
+        return value
+    try:
+        normalized = raw[:-1] + "+00:00" if raw.endswith("Z") else raw
+        parsed = datetime.fromisoformat(normalized)
+    except ValueError:
+        return raw
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=UTC)
+    return parsed.astimezone(UTC).strftime("%Y-%m-%d %H:%M UTC")
 
 
 def _default_review_comparison(result: ReviewResult) -> ReviewComparison:
@@ -262,6 +299,4 @@ def _provider_label(provider: str) -> str:
         "codex": "Codex",
         "claude": "Claude",
     }.get(provider, provider.capitalize())
-
-
 
