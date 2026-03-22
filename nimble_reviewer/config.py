@@ -18,7 +18,6 @@ class Settings:
     codex_quota_cmd: tuple[str, ...] | None
     claude_quota_cmd: tuple[str, ...] | None
     council_synthesis_provider: ReviewProvider
-    council_synthesis_cmd: tuple[str, ...]
     sqlite_path: Path
     repo_cache_dir: Path
     review_trace_dir: Path
@@ -45,7 +44,6 @@ class Settings:
             codex_quota_cmd=_read_optional_command("CODEX_QUOTA_CMD"),
             claude_quota_cmd=_read_optional_command("CLAUDE_QUOTA_CMD"),
             council_synthesis_provider=_read_review_provider("COUNCIL_SYNTHESIS_PROVIDER", default="codex"),
-            council_synthesis_cmd=_read_synthesis_command(),
             sqlite_path=Path(_read_required("SQLITE_PATH")),
             repo_cache_dir=Path(_read_required("REPO_CACHE_DIR")),
             review_trace_dir=Path(os.getenv("REVIEW_TRACE_DIR", "/data/review-traces")),
@@ -83,12 +81,3 @@ def _read_optional_command(env_name: str) -> tuple[str, ...] | None:
     if not value:
         return None
     return tuple(shlex.split(value))
-
-
-def _read_synthesis_command() -> tuple[str, ...]:
-    provider = _read_review_provider("COUNCIL_SYNTHESIS_PROVIDER", default="codex")
-    if provider == "codex":
-        default = 'codex exec -m gpt-5.4 -c model_reasoning_effort="low" -'
-    else:
-        default = "claude -p --output-format stream-json --model sonnet --effort low --permission-mode bypassPermissions"
-    return _read_command("COUNCIL_SYNTHESIS_CMD", default=default)

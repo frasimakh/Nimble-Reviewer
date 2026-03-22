@@ -176,43 +176,66 @@ class CouncilRunner:
         self,
         codex_runner: JsonCapableReviewAgent,
         claude_runner: JsonCapableReviewAgent,
-        synthesizer: JsonCapableReviewAgent,
+        synthesis_provider: ReviewProvider = "codex",
     ) -> None:
         self.codex_runner = codex_runner
         self.claude_runner = claude_runner
-        self.synthesizer = synthesizer
+        self.synthesis_provider = synthesis_provider
 
     def review(self, prompt: str, cwd: Path, trace: RunTrace | None = None) -> ReviewResult:
         provider_runs: list[_ProviderRun] = []
         codex_result, claude_result = self._run_parallel_reviews(prompt, cwd, trace, provider_runs)
+
+        if codex_result is None and claude_result is None:
+            raise ReviewAgentError("Both Codex and Claude reviews failed")
+
+        if codex_result is None or claude_result is None:
+            successful = codex_result if codex_result is not None else claude_result
+            assert successful is not None
+            failed_provider = "codex" if codex_result is None else "claude"
+            successful_provider = "claude" if codex_result is None else "codex"
+            LOGGER.warning(
+                "Council skipping synthesis: %s review failed, using %s result only findings=%s overall_risk=%s",
+                failed_provider,
+                successful_provider,
+                len(successful.findings),
+                successful.overall_risk,
+            )
+            if trace:
+                trace.write(
+                    "council",
+                    "synthesis.skipped",
+                    reason=f"{failed_provider}_review_failed",
+                    fallback_provider=successful_provider,
+                    findings=len(successful.findings),
+                    overall_risk=successful.overall_risk,
+                )
+            participants = _summarize_participants(provider_runs, reviewer_overview=None)
+            return ReviewResult(
+                summary=successful.summary,
+                overall_risk=successful.overall_risk,
+                findings=successful.findings,
+                participants=participants,
+            )
 
         synthesis_prompt = build_council_synthesis_prompt(
             prompt,
             codex_result=codex_result,
             claude_result=claude_result,
         )
-        if trace:
-            trace.write(
-                "council",
-                "synthesis.started",
-                provider=self.synthesizer.provider_name,
-            )
-        LOGGER.info(
-            "Council synthesis started provider=%s model=%s reasoning=%s",
-            self.synthesizer.provider_name,
-            self.synthesizer.agent_metadata.model or "default",
-            self.synthesizer.agent_metadata.reasoning_effort or "default",
+        primary_synth = self.codex_runner if self.synthesis_provider == "codex" else self.claude_runner
+        fallback_synth = self.claude_runner if self.synthesis_provider == "codex" else self.codex_runner
+        synthesizer, synthesis_payload, synthesis_usage = self._run_synthesis(
+            synthesis_prompt, cwd, trace, primary_synth, fallback_synth
         )
-        synthesis_started = time.monotonic()
-        synthesis_payload, synthesis_usage = self.synthesizer.run_json(synthesis_prompt, cwd, trace=trace)
         reviewer_overview = _parse_reviewer_overview_payload(synthesis_payload.get("reviewer_overview"))
         if trace:
-            trace.write_snapshot(f"{self.synthesizer.provider_name}.synthesis", synthesis_payload)
+            trace.write_snapshot(f"{synthesizer.provider_name}.synthesis", synthesis_payload)
         provider_runs.append(
             _ProviderRun(
-                provider=self.synthesizer.provider_name,  # type: ignore[arg-type]
+                provider=synthesizer.provider_name,  # type: ignore[arg-type]
                 phase="synthesis",
-                metadata=self.synthesizer.agent_metadata,
+                metadata=synthesizer.agent_metadata,
                 token_usage=synthesis_usage,
                 summary=str(synthesis_payload.get("summary", "")).strip() or None,
                 overall_risk=str(synthesis_payload.get("overall_risk", "")).strip().lower() or None,
@@ -234,7 +257,7 @@ class CouncilRunner:
             trace.write(
                 "council",
                 "synthesis.completed",
-                provider=self.synthesizer.provider_name,
+                provider=synthesizer.provider_name,
                 findings=len(final_result.findings),
                 overall_risk=final_result.overall_risk,
                 preserved_findings=preserved_count,
@@ -252,13 +275,12 @@ class CouncilRunner:
                 ],
             )
         LOGGER.info(
-            "Council synthesis finished provider=%s findings=%s overall_risk=%s preserved_findings=%s attribution_updates=%s phase_sec=%.2f",
-            self.synthesizer.provider_name,
+            "Council synthesis finished provider=%s findings=%s overall_risk=%s preserved_findings=%s attribution_updates=%s",
+            synthesizer.provider_name,
             len(final_result.findings),
             final_result.overall_risk,
             preserved_count,
             attribution_updates,
-            time.monotonic() - synthesis_started,
         )
         return ReviewResult(
             summary=final_result.summary,
@@ -310,8 +332,8 @@ class CouncilRunner:
         cwd: Path,
         trace: RunTrace | None,
         provider_runs: list["_ProviderRun"],
-    ) -> tuple[ReviewResult, ReviewResult]:
-        results: dict[str, tuple[ReviewResult, _ProviderRun]] = {}
+    ) -> tuple[ReviewResult | None, ReviewResult | None]:
+        results: dict[str, ReviewResult] = {}
         with ThreadPoolExecutor(max_workers=2, thread_name_prefix="council-review") as executor:
             future_to_provider = {
                 executor.submit(self._run_review_phase, self.codex_runner, prompt, cwd, trace): "codex",
@@ -319,20 +341,84 @@ class CouncilRunner:
             }
             for future in as_completed(future_to_provider):
                 provider = future_to_provider[future]
-                result = future.result()
+                try:
+                    result = future.result()
+                except Exception as exc:  # noqa: BLE001
+                    LOGGER.warning("Council %s review failed: %s", provider, exc)
+                    if trace:
+                        trace.write("council", "review.failed", provider=provider, error=str(exc))
+                    continue
+                runner_ref = self.codex_runner if provider == "codex" else self.claude_runner
                 provider_runs.append(
                     _ProviderRun(
                         provider=provider,  # type: ignore[arg-type]
                         phase="review",
-                        metadata=result.agent_metadata or ReviewAgentMetadata(provider=provider),  # type: ignore[arg-type]
+                        metadata=result.agent_metadata or runner_ref.agent_metadata,
                         token_usage=result.token_usage,
                         quota_status=result.quota_status,
                         summary=result.summary or None,
                         overall_risk=result.overall_risk,
                     )
                 )
-                results[provider] = (result, provider_runs[-1])
-        return results["codex"][0], results["claude"][0]
+                results[provider] = result
+        return results.get("codex"), results.get("claude")
+
+    def _run_synthesis(
+        self,
+        prompt: str,
+        cwd: Path,
+        trace: RunTrace | None,
+        primary: JsonCapableReviewAgent,
+        fallback: JsonCapableReviewAgent,
+    ) -> tuple[JsonCapableReviewAgent, dict, ReviewTokenUsage | None]:
+        if trace:
+            trace.write("council", "synthesis.started", provider=primary.provider_name)
+        LOGGER.info(
+            "Council synthesis started provider=%s model=%s reasoning=%s",
+            primary.provider_name,
+            primary.agent_metadata.model or "default",
+            primary.agent_metadata.reasoning_effort or "default",
+        )
+        started = time.monotonic()
+        try:
+            payload, usage = primary.run_json(prompt, cwd, trace=trace)
+            LOGGER.info(
+                "Council synthesis finished provider=%s phase_sec=%.2f",
+                primary.provider_name,
+                time.monotonic() - started,
+            )
+            return primary, payload, usage
+        except Exception as exc:  # noqa: BLE001
+            LOGGER.warning(
+                "Council synthesis failed provider=%s: %s; retrying with %s",
+                primary.provider_name,
+                exc,
+                fallback.provider_name,
+            )
+            if trace:
+                trace.write(
+                    "council",
+                    "synthesis.failed",
+                    provider=primary.provider_name,
+                    error=str(exc),
+                    fallback_provider=fallback.provider_name,
+                )
+        if trace:
+            trace.write("council", "synthesis.started", provider=fallback.provider_name)
+        LOGGER.info(
+            "Council synthesis started provider=%s model=%s reasoning=%s (fallback)",
+            fallback.provider_name,
+            fallback.agent_metadata.model or "default",
+            fallback.agent_metadata.reasoning_effort or "default",
+        )
+        fallback_started = time.monotonic()
+        payload, usage = fallback.run_json(prompt, cwd, trace=trace)
+        LOGGER.info(
+            "Council synthesis finished provider=%s phase_sec=%.2f (fallback)",
+            fallback.provider_name,
+            time.monotonic() - fallback_started,
+        )
+        return fallback, payload, usage
 
 
 @dataclass(frozen=True)
