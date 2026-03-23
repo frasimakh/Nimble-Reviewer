@@ -117,6 +117,7 @@ class FakeRepoManager:
         self.workspace = workspace
         self.review_rules_path = review_rules_path
         self.review_rules_text = review_rules_text
+        self.prepare_calls = []
         self.diff_text = diff_text or (
             "diff --git a/file.py b/file.py\n"
             "--- a/file.py\n"
@@ -128,6 +129,7 @@ class FakeRepoManager:
         self.changed_files = changed_files or ["file.py"]
 
     def prepare_checkout(self, repo_http_url, source_sha, target_branch, trace=None):
+        self.prepare_calls.append((repo_http_url, source_sha, target_branch))
         return PreparedCheckout(
             path=self.workspace,
             merge_base="base123",
@@ -160,10 +162,12 @@ class FakeDiscussionReconcileAgent:
     def __init__(self, payload=None):
         self.payload = payload or {"decision": "no_action", "reason": "No action."}
         self.last_prompt = None
+        self.last_cwd = None
         self.agent_metadata = None
 
     def run_json(self, prompt, cwd, trace=None):
         self.last_prompt = prompt
+        self.last_cwd = cwd
         return self.payload, None
 
 
@@ -546,6 +550,71 @@ class ReviewServiceTests(unittest.TestCase):
         self.assertEqual(updated.status, "open")
         self.assertFalse(gitlab.discussions[0].resolved)
         self.assertIn("I still see a risk here", gitlab.discussions[0].notes[-1].body)
+
+    def test_discussion_reconcile_runs_agent_from_checkout_path(self):
+        workspace = Path(self.tmpdir.name)
+        gitlab = FakeGitLabClient()
+        discussion = GitLabDiscussion(
+            id="d1",
+            individual_note=False,
+            notes=(
+                GitLabNote(id=100, body="Bot finding", author_id=gitlab.current_user.id),
+                GitLabNote(id=101, body="I fixed this by adding a guard.", author_id=123),
+            ),
+            resolved=False,
+            resolvable=True,
+            position=GitLabDiffPosition(
+                base_sha="base",
+                start_sha="start",
+                head_sha="sha1",
+                old_path="file.py",
+                new_path="file.py",
+                new_line=1,
+            ),
+        )
+        gitlab.discussions.append(discussion)
+        self.store.upsert_tracked_finding(
+            TrackedFinding(
+                project_id=1,
+                mr_iid=2,
+                fingerprint="fp1",
+                status="open",
+                severity="medium",
+                file="file.py",
+                line=1,
+                title="Bug",
+                body="Needs fixing",
+                discussion_id="d1",
+                root_note_id=100,
+                thread_owner="bot",
+                opened_sha="sha1",
+                last_seen_sha="sha1",
+            )
+        )
+        repo_manager = FakeRepoManager(workspace)
+        reconcile_agent = FakeDiscussionReconcileAgent()
+        service = self._service(
+            gitlab,
+            repo_manager,
+            FakeReviewAgentRunner(result=ReviewResult(summary="unused", overall_risk="low", findings=())),
+            reconcile_agent=reconcile_agent,
+        )
+
+        self.store.enqueue_run(
+            1,
+            2,
+            "sha1",
+            None,
+            kind="discussion_reconcile",
+            trigger_discussion_id="d1",
+            trigger_note_id=101,
+            trigger_author_id=123,
+        )
+        run = self.store.claim_next_run()
+        service.process_run(run)
+
+        self.assertEqual(repo_manager.prepare_calls, [(gitlab.mr_info.repo_http_url, "sha1", gitlab.mr_info.target_branch)])
+        self.assertEqual(reconcile_agent.last_cwd, workspace)
 
     def test_full_review_does_not_attach_to_nearby_human_discussion_on_different_line(self):
         workspace = Path(self.tmpdir.name)

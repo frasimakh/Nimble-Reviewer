@@ -260,15 +260,24 @@ class ReviewService:
                 self.store.mark_done(run.id, run.project_id, run.mr_iid, mr_info.source_sha)
                 return
 
-            trigger_note = _find_note_in_discussion(discussion, run.trigger_note_id)
-            prompt = build_discussion_reconcile_prompt(
-                mr_info,
-                discussion_id=discussion.id,
-                discussion_text=_render_discussion_context(discussion),
-                trigger_note_body=(trigger_note.body if trigger_note else discussion.root_note.body if discussion.root_note else ""),
-                linked_finding_payload=_tracked_finding_payload(tracked),
+            checkout = self.repo_manager.prepare_checkout(
+                mr_info.repo_http_url,
+                mr_info.source_sha,
+                mr_info.target_branch,
+                trace=trace,
             )
-            payload, _ = self.discussion_reconcile_agent.run_json(prompt, Path.cwd(), trace=trace)
+            try:
+                trigger_note = _find_note_in_discussion(discussion, run.trigger_note_id)
+                prompt = build_discussion_reconcile_prompt(
+                    mr_info,
+                    discussion_id=discussion.id,
+                    discussion_text=_render_discussion_context(discussion),
+                    trigger_note_body=(trigger_note.body if trigger_note else discussion.root_note.body if discussion.root_note else ""),
+                    linked_finding_payload=_tracked_finding_payload(tracked),
+                )
+                payload, _ = self.discussion_reconcile_agent.run_json(prompt, checkout.path, trace=trace)
+            finally:
+                checkout.close()
             decision = _parse_discussion_reconcile_result(payload)
             if trace:
                 trace.write_snapshot("discussion.reconcile", payload)
