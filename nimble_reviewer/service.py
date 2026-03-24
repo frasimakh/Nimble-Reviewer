@@ -769,10 +769,14 @@ def _parse_discussion_reconcile_result(payload: dict) -> DiscussionReconcileResu
     return DiscussionReconcileResult(decision=decision, reason=reason, reply_body=reply_body)  # type: ignore[arg-type]
 
 
-def _format_provider_label(sources: tuple) -> str:
+def _format_provider_label(sources: tuple) -> tuple[str, bool]:
+    """Return (label_markdown, both_found) for the given sources."""
     names = {"codex": "Codex", "claude": "Claude"}
     labels = [names.get(s, s.capitalize()) for s in sources if s in names]
-    return " + ".join(labels) if labels else ""
+    both = len(labels) >= 2
+    if both:
+        return "**Codex + Claude**", True
+    return labels[0] if labels else "", False
 
 
 def _reply_with_marker(body: str, fingerprint: str, provider: str = "") -> str:
@@ -782,17 +786,21 @@ def _reply_with_marker(body: str, fingerprint: str, provider: str = "") -> str:
 
 
 def _render_finding_thread_body(finding: ReviewFinding, fingerprint: str) -> str:
-    provider_label = _format_provider_label(finding.sources)
+    provider_label, both_found = _format_provider_label(finding.sources)
+    is_low_single = not both_found and finding.severity == "low"
+
     header = f"**Nimble Reviewer** · `{finding.severity.upper()}`"
     if provider_label:
         header += f" · {provider_label}"
-    lines = [
-        header,
-        "",
-        f"**{finding.title}**",
-        "",
-        finding.body,
-    ]
+    if is_low_single:
+        header += " · *minor note*"
+
+    title = f"_**{finding.title}**_" if is_low_single else f"**{finding.title}**"
+
+    lines = [header]
+    if both_found:
+        lines.extend(["", "> Both reviewers flagged this independently."])
+    lines.extend(["", title, "", finding.body])
     if finding.suggestion:
         lines.extend(["", f"Suggested fix: {finding.suggestion}"])
     lines.extend(["", _finding_marker(fingerprint)])
