@@ -101,9 +101,9 @@ class RendererTests(unittest.TestCase):
             ),
         )
 
-        self.assertIn("**Codex** · risk **MEDIUM** · `gpt-5.4` · reasoning `high`", body)
-        self.assertIn("**Claude** · risk **MEDIUM** · `sonnet` · reasoning `high`", body)
-        self.assertIn("**Council** · overall risk **MEDIUM** · `gpt-5.4` · reasoning `low` (synthesis)", body)
+        self.assertIn("**Codex** · **MEDIUM** · `gpt-5.4` · reasoning `high`", body)
+        self.assertIn("**Claude** · **MEDIUM** · `sonnet` · reasoning `high`", body)
+        self.assertIn("**Council** · **MEDIUM** · `gpt-5.4` · reasoning `low` (synthesis)", body)
 
     def test_success_note_renders_resolved_section_when_present(self):
         body = render_success_note(

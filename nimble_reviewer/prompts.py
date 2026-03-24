@@ -75,6 +75,7 @@ Rules:
 - If there are no actionable issues, return an empty findings array.
 - Keep summary concise. Use it to say what this reviewer actually found and how risky it is; do not restate the whole MR.
 - Keep each finding title short and specific.
+- Write `body` in plain, direct language: 1–2 short sentences stating the problem and its consequence. Avoid long complex clauses and technical jargon where plain words work.
 - Include `suggestion` only when you have a concrete, short remediation direction.
 - Use repository context when needed, but keep the final output concise and structured.
 - Consider existing MR discussion context. Do not restate concerns that have already been convincingly dismissed by discussion unless the visible diff reintroduces the risk.
@@ -194,7 +195,7 @@ Rules:
 - Use the two base reviews as inputs.
 - Do not drop findings from either base review.
 - Every base-review finding must appear in the final output either as a merged issue or as its own standalone issue.
-- You may merge findings when they clearly refer to the same underlying problem.
+- Merge findings that describe the same root cause even if they point to different files, lines, or use different wording. Prefer one clear merged finding over two overlapping ones.
 - Use `sources` only for the models that independently found the issue in their base reviews.
 - Use `sources=["codex","claude"]` only when both base reviews independently surfaced the same underlying issue.
 - `opinions` is optional, but include it when it improves transparency about how each model viewed the final finding.
@@ -205,6 +206,7 @@ Rules:
 - Prefer keeping unique but credible findings from one model instead of dropping them.
 - Your job is synthesis and de-duplication, not suppression.
 - Omit praise and style nits unless they represent a real risk.
+- Write each `body` in plain, direct language: 1–2 short sentences stating the problem and its consequence. Avoid long complex clauses.
 - Write `summary` as the final council verdict only. It will be shown directly to developers in the MR comment, so be direct and opinionated: state whether the MR is safe to merge, needs fixes, or has blockers. If concerns are minor or raised by only one model, say so (e.g. "Safe to merge — concerns are minimal and low-confidence"). Do not just list findings; give a clear recommendation.
 - Fill `reviewer_overview.codex` and `reviewer_overview.claude` with short reviewer-specific notes describing what each model independently surfaced, emphasized, or agreed with.
 - Do not repeat or paraphrase the full base-review summaries inside `summary`; use `reviewer_overview` for reviewer-specific attribution.

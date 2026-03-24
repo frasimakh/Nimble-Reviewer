@@ -7,10 +7,9 @@ from nimble_reviewer.models import ReviewFinding
 
 
 def findings_match(left: ReviewFinding, right: ReviewFinding) -> bool:
-    if left.file != right.file:
-        return False
+    same_file = left.file == right.file
 
-    if left.line == right.line:
+    if same_file and left.line == right.line:
         return True
 
     left_title = _normalize_text(left.title)
@@ -20,12 +19,17 @@ def findings_match(left: ReviewFinding, right: ReviewFinding) -> bool:
 
     title_overlap = _token_overlap(left.title, right.title)
     combined_overlap = _token_overlap(f"{left.title} {left.body}", f"{right.title} {right.body}")
-    close_lines = abs(left.line - right.line) <= 3
 
     if title_overlap >= 0.6:
         return True
-    if close_lines and combined_overlap >= 0.28:
-        return True
+    if same_file:
+        close_lines = abs(left.line - right.line) <= 3
+        if close_lines and combined_overlap >= 0.28:
+            return True
+    else:
+        # Cross-file: require strong semantic overlap to avoid false positives
+        if title_overlap >= 0.5 and combined_overlap >= 0.4:
+            return True
     return False
 
 

@@ -300,7 +300,7 @@ class ReviewServiceTests(unittest.TestCase):
         tracked = self.store.list_tracked_findings(1, 2)
         self.assertEqual(len(gitlab.discussions), 1)
         self.assertEqual(tracked[0].thread_owner, "bot")
-        self.assertIn("`0 unplaced`", gitlab.summary_note.body)
+        self.assertNotIn("`0 unplaced`", gitlab.summary_note.body)
 
     def test_full_review_is_superseded_when_inline_publish_fails_after_head_changes(self):
         workspace = Path(self.tmpdir.name)
@@ -377,7 +377,7 @@ class ReviewServiceTests(unittest.TestCase):
         second_service.process_run(second_run)
 
         self.assertEqual(len(gitlab.discussions), 1)
-        self.assertIn("`0 new`", gitlab.summary_note.body)
+        self.assertNotIn("`0 new`", gitlab.summary_note.body)
         self.assertIn("`1 still present`", gitlab.summary_note.body)
 
     def test_full_review_resolves_bot_owned_discussion_when_finding_disappears(self):

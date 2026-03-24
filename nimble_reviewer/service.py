@@ -236,12 +236,13 @@ class ReviewService:
         refreshed to reflect any status change.
         """
         LOGGER.info(
-            "Starting discussion reconcile run_id=%s project=%s mr=%s discussion=%s note=%s",
+            "Starting discussion reconcile run_id=%s project=%s mr=%s discussion=%s note=%s provider=%s",
             run.id,
             run.project_id,
             run.mr_iid,
             run.trigger_discussion_id or "-",
             run.trigger_note_id or "-",
+            self.discussion_reconcile_agent.provider_name,
         )
         trace = self._create_trace(run)
         try:
@@ -283,7 +284,7 @@ class ReviewService:
                 trace.write_snapshot("discussion.reconcile", payload)
 
             if decision.reply_body:
-                self.gitlab.add_discussion_note(run.project_id, run.mr_iid, discussion.id, _reply_with_marker(decision.reply_body, tracked.fingerprint))
+                self.gitlab.add_discussion_note(run.project_id, run.mr_iid, discussion.id, _reply_with_marker(decision.reply_body, tracked.fingerprint, self.discussion_reconcile_agent.provider_name))
             if decision.decision == "dismissed_by_discussion":
                 tracked = dc_replace(tracked, status="dismissed_by_discussion", dismissed_sha=mr_info.source_sha, updated_at=None)
                 self.store.upsert_tracked_finding(tracked)
@@ -768,13 +769,25 @@ def _parse_discussion_reconcile_result(payload: dict) -> DiscussionReconcileResu
     return DiscussionReconcileResult(decision=decision, reason=reason, reply_body=reply_body)  # type: ignore[arg-type]
 
 
-def _reply_with_marker(body: str, fingerprint: str) -> str:
-    return f"{body.strip()}\n\n{_finding_marker(fingerprint)}"
+def _format_provider_label(sources: tuple) -> str:
+    names = {"codex": "Codex", "claude": "Claude"}
+    labels = [names.get(s, s.capitalize()) for s in sources if s in names]
+    return " + ".join(labels) if labels else ""
+
+
+def _reply_with_marker(body: str, fingerprint: str, provider: str = "") -> str:
+    label = {"codex": "Codex", "claude": "Claude"}.get(provider, "")
+    prefix = f"**Nimble Reviewer** ({label})\n\n" if label else ""
+    return f"{prefix}{body.strip()}\n\n{_finding_marker(fingerprint)}"
 
 
 def _render_finding_thread_body(finding: ReviewFinding, fingerprint: str) -> str:
+    provider_label = _format_provider_label(finding.sources)
+    header = f"**Nimble Reviewer** · `{finding.severity.upper()}`"
+    if provider_label:
+        header += f" · {provider_label}"
     lines = [
-        f"**Nimble Reviewer** · `{finding.severity.upper()}`",
+        header,
         "",
         f"**{finding.title}**",
         "",

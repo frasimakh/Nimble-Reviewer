@@ -39,20 +39,19 @@ def render_success_note(
     else:
         lines.extend([f"Overall risk: **{result.overall_risk.upper()}**", "", result.summary.strip(), ""])
 
-    lines.extend(
-        [
-            f"Open findings: `{metrics.open_count}`",
-            (
-                "Changes: "
-                f"`{metrics.new_count} new` "
-                f"`{metrics.still_present_count} still present` "
-                f"`{metrics.resolved_count} resolved` "
-                f"`{metrics.dismissed_count} dismissed by discussion` "
-                f"`{metrics.unplaced_count} unplaced`"
-            ),
-            "",
-        ]
-    )
+    change_parts = []
+    if metrics.new_count:
+        change_parts.append(f"`{metrics.new_count} new`")
+    if metrics.still_present_count:
+        change_parts.append(f"`{metrics.still_present_count} still present`")
+    if metrics.resolved_count:
+        change_parts.append(f"`{metrics.resolved_count} resolved`")
+    if metrics.dismissed_count:
+        change_parts.append(f"`{metrics.dismissed_count} dismissed by discussion`")
+    if metrics.unplaced_count:
+        change_parts.append(f"`{metrics.unplaced_count} unplaced`")
+    changes_line = ("Changes: " + " ".join(change_parts)) if change_parts else "No changes."
+    lines.extend([f"Open findings: `{metrics.open_count}`", changes_line, ""])
 
     if unplaced_findings:
         lines.extend(["## Unplaced Findings", ""])
@@ -126,7 +125,7 @@ def _render_summary_with_council(result: ReviewResult) -> list[str]:
 
     for participant in synthesis_participants:
         meta = _participant_meta_inline(participant)
-        lines.extend([f"**Council** · overall risk **{result.overall_risk.upper()}** · {meta} (synthesis)"])
+        lines.extend([f"**Council** · **{result.overall_risk.upper()}** · {meta} (synthesis)"])
         summary_text = _synthesis_meta_summary(review_participants, result)
         if summary_text:
             lines.extend([f"> {summary_text}", ""])
@@ -134,7 +133,7 @@ def _render_summary_with_council(result: ReviewResult) -> list[str]:
             lines.append("")
 
     if not synthesis_participants:
-        lines.extend([f"**Council** · overall risk **{result.overall_risk.upper()}**", f"> {result.summary.strip()}", ""])
+        lines.extend([f"**Council** · **{result.overall_risk.upper()}**", f"> {result.summary.strip()}", ""])
     return lines
 
 
@@ -166,7 +165,7 @@ def _participant_meta_inline(participant: ReviewParticipant) -> str:
 
 def _participant_risk_inline(participant: ReviewParticipant) -> str:
     risk = (participant.overall_risk or "unknown").upper()
-    return f"risk **{risk}**"
+    return f"**{risk}**"
 
 
 def _severity_label(severity: str) -> str:
