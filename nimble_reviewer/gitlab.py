@@ -242,6 +242,19 @@ class GitLabClient:
                 return discussions
             page = int(next_page)
 
+    def delete_note(self, project_id: int, mr_iid: int, note_id: int) -> None:
+        LOGGER.info("Deleting MR note project=%s mr=%s note_id=%s", project_id, mr_iid, note_id)
+        self._request_json("DELETE", f"/projects/{project_id}/merge_requests/{mr_iid}/notes/{note_id}")
+
+    def create_plain_discussion(self, project_id: int, mr_iid: int, body: str) -> GitLabDiscussion:
+        LOGGER.info("Creating plain discussion project=%s mr=%s", project_id, mr_iid)
+        payload = self._request_json(
+            "POST",
+            f"/projects/{project_id}/merge_requests/{mr_iid}/discussions",
+            data={"body": body},
+        )
+        return _parse_discussion(payload)
+
     def create_diff_discussion(
         self,
         project_id: int,

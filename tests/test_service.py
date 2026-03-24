@@ -62,6 +62,23 @@ class FakeGitLabClient:
         self.summary_note = GitLabNote(id=note_id, body=body, author_id=self.current_user.id)
         return self.summary_note
 
+    def delete_note(self, project_id, mr_iid, note_id):
+        if self.summary_note and self.summary_note.id == note_id:
+            self.summary_note = None
+
+    def create_plain_discussion(self, project_id, mr_iid, body):
+        note_id = 100 + len(self.discussions) * 10
+        discussion = GitLabDiscussion(
+            id=f"d{len(self.discussions) + 1}",
+            individual_note=False,
+            notes=(GitLabNote(id=note_id, body=body, author_id=self.current_user.id),),
+            resolved=False,
+            resolvable=True,
+            position=None,
+        )
+        self.discussions.append(discussion)
+        return discussion
+
     def create_diff_discussion(self, project_id, mr_iid, body, position):
         if self.raise_on_create_diff_discussion:
             raise GitLabError('GitLab API error 500 for POST /projects/1/merge_requests/2/discussions: {"message":"500 Internal Server Error"}')
@@ -192,7 +209,7 @@ class ReviewServiceTests(unittest.TestCase):
             )
         )
 
-    def test_full_review_creates_summary_note_and_inline_discussion(self):
+    def test_full_review_creates_inline_discussion(self):
         workspace = Path(self.tmpdir.name)
         (workspace / "file.py").write_text("new line\nsecond line\n", encoding="utf-8")
         gitlab = FakeGitLabClient()
@@ -212,17 +229,15 @@ class ReviewServiceTests(unittest.TestCase):
         run = self.store.claim_next_run()
         service.process_run(run)
 
-        state = self.store.get_merge_request_state(1, 2)
         tracked = self.store.list_tracked_findings(1, 2)
         self.assertEqual(decision.run_id, run.id)
-        self.assertEqual(state.summary_note_id, 99)
         self.assertEqual(len(gitlab.discussions), 1)
         self.assertEqual(len(tracked), 1)
         self.assertEqual(tracked[0].status, "open")
         self.assertEqual(tracked[0].thread_owner, "bot")
-        self.assertIn("Open findings: `1`", gitlab.summary_note.body)
+        self.assertIsNone(gitlab.summary_note)
 
-    def test_full_review_falls_back_to_summary_when_inline_publish_fails_but_head_is_stable(self):
+    def test_full_review_creates_plain_discussion_when_inline_publish_fails_but_head_is_stable(self):
         workspace = Path(self.tmpdir.name)
         (workspace / "file.py").write_text("new line\nsecond line\n", encoding="utf-8")
         gitlab = FakeGitLabClient()
@@ -246,11 +261,11 @@ class ReviewServiceTests(unittest.TestCase):
         tracked = self.store.list_tracked_findings(1, 2)
         stored_run = self.store.get_run(run.id)
         self.assertEqual(stored_run.status, "done")
-        self.assertEqual(len(gitlab.discussions), 0)
-        self.assertEqual(tracked[0].thread_owner, "summary-only")
-        self.assertIn("`1 unplaced`", gitlab.summary_note.body)
+        self.assertEqual(len(gitlab.discussions), 1)
+        self.assertEqual(tracked[0].thread_owner, "bot")
+        self.assertIsNone(gitlab.discussions[0].position)  # plain thread, not a diff discussion
 
-    def test_full_review_retries_summary_only_finding_as_inline_on_next_sha(self):
+    def test_full_review_reuses_plain_discussion_from_failed_inline_on_next_sha(self):
         workspace = Path(self.tmpdir.name)
         (workspace / "file.py").write_text("new line\nsecond line\n", encoding="utf-8")
         gitlab = FakeGitLabClient()
@@ -297,10 +312,11 @@ class ReviewServiceTests(unittest.TestCase):
         second_run = self.store.claim_next_run()
         retry_service.process_run(second_run)
 
+        # After two runs, still only 1 discussion: the plain thread from run 1,
+        # reused by run 2 (no new thread created on the updated SHA).
         tracked = self.store.list_tracked_findings(1, 2)
         self.assertEqual(len(gitlab.discussions), 1)
         self.assertEqual(tracked[0].thread_owner, "bot")
-        self.assertNotIn("`0 unplaced`", gitlab.summary_note.body)
 
     def test_full_review_publishes_summary_only_when_head_changes_before_publish(self):
         # When the MR head advances while the review LLM is running, the review
@@ -328,12 +344,13 @@ class ReviewServiceTests(unittest.TestCase):
 
         stored_run = self.store.get_run(run.id)
         self.assertEqual(stored_run.status, "done")
-        self.assertIsNotNone(gitlab.summary_note)
-        # All findings land in summary-only; no inline discussions created
-        self.assertEqual(len(gitlab.discussions), 0)
+        self.assertIsNone(gitlab.summary_note)
+        # Findings become plain discussions (no inline diff positions)
+        self.assertEqual(len(gitlab.discussions), 1)
         tracked = self.store.list_tracked_findings(1, 2)
         self.assertEqual(len(tracked), 1)
-        self.assertEqual(tracked[0].thread_owner, "summary-only")
+        self.assertEqual(tracked[0].thread_owner, "bot")
+        self.assertIsNone(gitlab.discussions[0].position)
 
     def test_second_full_review_reuses_existing_discussion_and_marks_still_present(self):
         workspace = Path(self.tmpdir.name)
@@ -383,8 +400,7 @@ class ReviewServiceTests(unittest.TestCase):
         second_service.process_run(second_run)
 
         self.assertEqual(len(gitlab.discussions), 1)
-        self.assertNotIn("`0 new`", gitlab.summary_note.body)
-        self.assertIn("`1 still present`", gitlab.summary_note.body)
+        self.assertIsNone(gitlab.summary_note)
 
     def test_full_review_resolves_bot_owned_discussion_when_finding_disappears(self):
         workspace = Path(self.tmpdir.name)
@@ -428,7 +444,7 @@ class ReviewServiceTests(unittest.TestCase):
         tracked = self.store.list_tracked_findings(1, 2)
         self.assertEqual(tracked[0].status, "resolved")
         self.assertEqual(gitlab.resolved_changes, [("d1", True)])
-        self.assertIn("`1 resolved`", gitlab.summary_note.body)
+        self.assertIsNone(gitlab.summary_note)
 
     def test_discussion_reconcile_dismisses_bot_thread_and_resolves_it(self):
         workspace = Path(self.tmpdir.name)
@@ -489,7 +505,7 @@ class ReviewServiceTests(unittest.TestCase):
         self.assertEqual(tracked[0].status, "dismissed_by_discussion")
         self.assertTrue(gitlab.discussions[0].resolved)
         self.assertIn("dismissed-by-discussion", gitlab.discussions[0].notes[-1].body)
-        self.assertIn("`1 dismissed by discussion`", gitlab.summary_note.body)
+        self.assertIsNone(gitlab.summary_note)
 
     def test_discussion_reconcile_replies_in_human_thread_without_resolving(self):
         gitlab = FakeGitLabClient()
@@ -663,6 +679,38 @@ class ReviewServiceTests(unittest.TestCase):
         self.assertEqual(gitlab.discussions[0].id, "human-1")
         self.assertEqual(len(gitlab.discussions[0].notes), 1)
         self.assertEqual(gitlab.discussions[1].root_note.author_id, gitlab.current_user.id)
+
+
+    def test_failure_note_is_deleted_on_next_successful_run(self):
+        # A transient failure leaves a "Review failed" note on the MR.
+        # The next successful run should delete it so it doesn't linger.
+        workspace = Path(self.tmpdir.name)
+        (workspace / "file.py").write_text("new line\nsecond line\n", encoding="utf-8")
+        gitlab = FakeGitLabClient()
+
+        # Simulate a pre-existing failure note left by a previous run.
+        from nimble_reviewer.renderer import note_marker
+        failure_body = note_marker(1, 2) + "\nReview failed: some transient error"
+        gitlab.summary_note = GitLabNote(id=55, body=failure_body, author_id=gitlab.current_user.id)
+
+        service = self._service(
+            gitlab,
+            FakeRepoManager(workspace),
+            FakeReviewAgentRunner(
+                result=ReviewResult(
+                    summary="All good.",
+                    overall_risk="low",
+                    findings=(),
+                )
+            ),
+        )
+        self.store.enqueue_run(1, 2, "sha1", None)
+        run = self.store.claim_next_run()
+        service.process_run(run)
+
+        stored_run = self.store.get_run(run.id)
+        self.assertEqual(stored_run.status, "done")
+        self.assertIsNone(gitlab.summary_note)  # failure note was deleted
 
 
 if __name__ == "__main__":

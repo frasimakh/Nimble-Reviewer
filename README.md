@@ -2,8 +2,8 @@
 
 Containerized GitLab merge request review bot. The service accepts GitLab merge request and note webhooks, queues persisted review runs in SQLite, checks out the MR, runs Codex and Claude Code reviews in parallel, then publishes:
 
-- one short summary note per MR
-- inline GitLab discussions for findings that can be anchored to the diff
+- GitLab discussion threads for findings, inline when possible and top-level otherwise
+- a temporary failure note when a review run fails
 - lightweight discussion reconciliation when humans reply in MR threads
 
 Full review runs are triggered when a non-draft MR is opened or reopened, and when an existing MR moves from draft to ready. Pushes to an already-open MR still do not trigger an automatic full re-review. Human comments in merge request discussions can trigger a lightweight `discussion_reconcile` run when GitLab `note_events` are enabled.
@@ -51,18 +51,10 @@ The full review flow always runs the council:
 The synthesized findings are then published as:
 
 - inline discussions when the finding maps to a changed diff line
+- top-level merge request discussions when the finding cannot be anchored safely
 - replies in relevant human threads when the concern matches an existing discussion
-- summary-only findings when the finding cannot be anchored safely
 
-The summary note acts as a control panel. It includes:
-
-- reviewed SHA and timestamp
-- council verdict
-- counts for `open`, `new`, `still present`, `resolved`, `dismissed by discussion`, and `unplaced`
-- unplaced findings
-- resolved-in-code findings
-
-It intentionally does not duplicate the full body of inline findings.
+There is no persistent success note for completed reviews. If a run fails, the bot may leave a short failure note on the MR; the next successful full review deletes that note.
 
 ### Discussion reconcile
 
@@ -161,7 +153,7 @@ For Claude runs, the trace includes:
 - Claude provider events when `CLAUDE_CMD` uses `--output-format stream-json` or `--output-format json`
 - Claude token usage and `total_cost_usd` when the CLI includes usage fields in those events
 
-The summary note stays intentionally short. Inline discussion details live in GitLab discussions, not in the trace or the summary note.
+Discussion details live in GitLab discussions, not in the trace. Failure notes are only used for failed runs and are cleaned up on the next successful full review.
 
 ## Local run
 

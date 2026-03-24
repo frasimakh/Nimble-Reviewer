@@ -58,7 +58,6 @@ class _PublishedFinding:
 class _PublishedReviewState:
     metrics: ReviewSummaryMetrics
     current_states: tuple[ReviewFindingState, ...]
-    unplaced_findings: tuple[ReviewFinding, ...]
 
 
 class _StaleRunDuringPublish(RuntimeError):
@@ -194,21 +193,11 @@ class ReviewService:
                 LOGGER.info("Run %s became stale during inline publish", run.id)
                 return
 
-            note = self._upsert_success_note(
-                run.project_id,
-                run.mr_iid,
-                mr_info.source_sha,
-                result,
-                publication.metrics,
-                comparison,
-                publication.unplaced_findings,
-            )
-            self.store.update_summary_note_id(run.project_id, run.mr_iid, note.id)
+            self._delete_bot_note_if_present(run.project_id, run.mr_iid)
             self.store.mark_done(run.id, run.project_id, run.mr_iid, mr_info.source_sha)
             LOGGER.info(
-                "Completed full review run_id=%s note_id=%s total_sec=%.2f",
+                "Completed full review run_id=%s total_sec=%.2f",
                 run.id,
-                note.id,
                 time.monotonic() - started,
             )
             if trace:
@@ -217,7 +206,6 @@ class ReviewService:
                     "review.completed",
                     run_id=run.id,
                     run_kind=run.kind,
-                    note_id=note.id,
                     total_sec=round(time.monotonic() - started, 3),
                 )
         except Exception as exc:  # noqa: BLE001
@@ -299,28 +287,6 @@ class ReviewService:
                 tracked = dc_replace(tracked, last_seen_sha=mr_info.source_sha, updated_at=None)
                 self.store.upsert_tracked_finding(tracked)
 
-            latest_result = self._load_previous_success_result(run, kind="full_review") or ReviewResult(
-                summary="No completed full review is available yet.",
-                overall_risk="low",
-                findings=(),
-            )
-            current_tracked = self.store.list_tracked_findings(run.project_id, run.mr_iid)
-            metrics = _metrics_from_tracked_findings(current_tracked)
-            unplaced_findings = tuple(
-                _tracked_finding_to_review_finding(item)
-                for item in current_tracked
-                if item.status == "open" and item.thread_owner == "summary-only"
-            )
-            note = self._upsert_success_note(
-                run.project_id,
-                run.mr_iid,
-                mr_info.source_sha,
-                latest_result,
-                metrics,
-                None,
-                unplaced_findings,
-            )
-            self.store.update_summary_note_id(run.project_id, run.mr_iid, note.id)
             self.store.mark_done(run.id, run.project_id, run.mr_iid, mr_info.source_sha)
         except Exception as exc:  # noqa: BLE001
             LOGGER.exception("Discussion reconcile run %s failed", run.id)
@@ -366,7 +332,6 @@ class ReviewService:
         discussions_by_id = {discussion.id: discussion for discussion in discussions}
         used_tracked: set[str] = set()
         current_states: list[ReviewFindingState] = []
-        unplaced_findings: list[ReviewFinding] = []
         current_open_fingerprints: set[str] = set()
 
         for finding_state in comparison.current_findings:
@@ -430,6 +395,12 @@ class ReviewService:
                         context_snippet=finding.snippet,
                     )
                 else:
+                    created_plain = self.gitlab.create_plain_discussion(
+                        project_id, mr_iid, _render_finding_thread_body(finding, fp)
+                    )
+                    discussion_id = created_plain.id
+                    thread_owner = "bot"
+                    placement = "inline"
                     tracked = TrackedFinding(
                         project_id=project_id,
                         mr_iid=mr_iid,
@@ -442,12 +413,13 @@ class ReviewService:
                         body=finding.body,
                         suggestion=finding.suggestion,
                         sources=finding.sources,
-                        thread_owner="summary-only",
+                        discussion_id=created_plain.id,
+                        root_note_id=created_plain.root_note.id if created_plain.root_note else None,
+                        thread_owner="bot",
                         opened_sha=source_sha,
                         last_seen_sha=source_sha,
                         context_snippet=finding.snippet,
                     )
-                    unplaced_findings.append(finding)
 
             tracked = dc_replace(
                 tracked,
@@ -497,12 +469,11 @@ class ReviewService:
             still_present_count=sum(1 for item in current_states if item.status == "still_present"),
             resolved_count=resolved_count,
             dismissed_count=dismissed_count,
-            unplaced_count=len(unplaced_findings),
+            unplaced_count=0,
         )
         return _PublishedReviewState(
             metrics=metrics,
             current_states=tuple(current_states),
-            unplaced_findings=tuple(unplaced_findings),
         )
 
     def _create_inline_discussion_or_none(
@@ -562,6 +533,18 @@ class ReviewService:
                 exc,
             )
             return None
+
+    def _delete_bot_note_if_present(self, project_id: int, mr_iid: int) -> None:
+        """Delete the bot's summary/failure note from the MR, if one exists."""
+        state = self.store.get_merge_request_state(project_id, mr_iid)
+        marker = note_marker(project_id, mr_iid)
+        existing = self.gitlab.find_bot_note(project_id, mr_iid, marker, state.summary_note_id if state else None)
+        if existing:
+            try:
+                self.gitlab.delete_note(project_id, mr_iid, existing.id)
+                self.store.update_summary_note_id(project_id, mr_iid, None)
+            except Exception:  # noqa: BLE001
+                LOGGER.warning("Failed to delete bot note note_id=%s project=%s mr=%s", existing.id, project_id, mr_iid)
 
     def _create_trace(self, run: ReviewRun) -> RunTrace | None:
         path = self.trace_settings.directory / f"run-{run.id}.jsonl"

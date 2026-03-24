@@ -244,7 +244,7 @@ class Store:
             ).fetchone()
             return self._row_to_run(row) if row else None
 
-    def update_summary_note_id(self, project_id: int, mr_iid: int, note_id: int) -> None:
+    def update_summary_note_id(self, project_id: int, mr_iid: int, note_id: int | None) -> None:
         with closing(self._connect()) as conn:
             conn.execute(
                 """
