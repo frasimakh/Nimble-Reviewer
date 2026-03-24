@@ -302,12 +302,14 @@ class ReviewServiceTests(unittest.TestCase):
         self.assertEqual(tracked[0].thread_owner, "bot")
         self.assertNotIn("`0 unplaced`", gitlab.summary_note.body)
 
-    def test_full_review_is_superseded_when_inline_publish_fails_after_head_changes(self):
+    def test_full_review_publishes_summary_only_when_head_changes_before_publish(self):
+        # When the MR head advances while the review LLM is running, the review
+        # should still complete as summary-only (no inline diff threads) rather
+        # than being silently discarded.
         workspace = Path(self.tmpdir.name)
         (workspace / "file.py").write_text("new line\nsecond line\n", encoding="utf-8")
         gitlab = FakeGitLabClient()
-        gitlab.raise_on_create_diff_discussion = True
-        gitlab.head_sha_override = "sha2"
+        gitlab.head_sha_override = "sha2"  # head already advanced past sha1
         service = self._service(
             gitlab,
             FakeRepoManager(workspace),
@@ -325,9 +327,13 @@ class ReviewServiceTests(unittest.TestCase):
         service.process_run(run)
 
         stored_run = self.store.get_run(run.id)
-        self.assertEqual(stored_run.status, "superseded")
-        self.assertIsNone(gitlab.summary_note)
-        self.assertEqual(self.store.list_tracked_findings(1, 2), [])
+        self.assertEqual(stored_run.status, "done")
+        self.assertIsNotNone(gitlab.summary_note)
+        # All findings land in summary-only; no inline discussions created
+        self.assertEqual(len(gitlab.discussions), 0)
+        tracked = self.store.list_tracked_findings(1, 2)
+        self.assertEqual(len(tracked), 1)
+        self.assertEqual(tracked[0].thread_owner, "summary-only")
 
     def test_second_full_review_reuses_existing_discussion_and_marks_still_present(self):
         workspace = Path(self.tmpdir.name)

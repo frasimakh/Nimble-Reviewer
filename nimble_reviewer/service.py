@@ -164,13 +164,17 @@ class ReviewService:
             if self.store.get_run_status(run.id) != "running":
                 LOGGER.info("Run %s was superseded before publish", run.id)
                 return
-            if self.gitlab.get_merge_request_head_sha(run.project_id, run.mr_iid) != mr_info.source_sha:
-                self.store.mark_superseded_if_running(run.id)
-                LOGGER.info("Run %s became stale before publish", run.id)
-                return
+            current_head_sha = self.gitlab.get_merge_request_head_sha(run.project_id, run.mr_iid)
+            stale_before_publish = current_head_sha != mr_info.source_sha
+            if stale_before_publish:
+                LOGGER.info(
+                    "Run %s became stale before publish (head now %s); publishing summary-only",
+                    run.id,
+                    _short_sha(current_head_sha),
+                )
 
-            latest_version = self.gitlab.get_latest_merge_request_version(run.project_id, run.mr_iid)
             current_discussions = self.gitlab.list_merge_request_discussions(run.project_id, run.mr_iid)
+            latest_version = None if stale_before_publish else self.gitlab.get_latest_merge_request_version(run.project_id, run.mr_iid)
             try:
                 publication = self._publish_review_findings(
                     run_id=run.id,
@@ -183,6 +187,7 @@ class ReviewService:
                     discussions=current_discussions,
                     diff_mapping=diff_mapping,
                     latest_version=latest_version,
+                    force_summary_only=stale_before_publish,
                 )
             except _StaleRunDuringPublish:
                 self.store.mark_superseded_if_running(run.id)
@@ -335,6 +340,7 @@ class ReviewService:
         discussions: list[GitLabDiscussion],
         diff_mapping: DiffMapping,
         latest_version,
+        force_summary_only: bool = False,
     ) -> _PublishedReviewState:
         """Place each finding into a GitLab discussion thread and update the store.
 
@@ -344,6 +350,12 @@ class ReviewService:
         3. Creates a new inline diff discussion via the GitLab API.
         4. Falls back to ``summary-only`` placement when no diff position is
            available or inline creation fails because the MR head is stable.
+
+        When *force_summary_only* is ``True`` all new findings are placed as
+        ``summary-only`` — no diff position lookup and no inline discussion
+        creation.  Use this when the MR head advanced after the review
+        completed (diff positions are no longer valid) but the findings
+        themselves are still worth publishing.
 
         Raises ``_StaleRunDuringPublish`` if the MR head changes mid-publish
         (caller marks the run superseded and aborts without posting a note).
@@ -382,7 +394,7 @@ class ReviewService:
                 tracked = None
 
             if tracked is None:
-                position = diff_mapping.to_position(finding.file, finding.line, latest_version)
+                position = None if force_summary_only else diff_mapping.to_position(finding.file, finding.line, latest_version)
                 created_discussion = None
                 if position is not None:
                     created_discussion = self._create_inline_discussion_or_none(
