@@ -33,7 +33,7 @@ Supporting modules: `models.py` (frozen dataclasses), `config.py` (env vars), `t
 
 1. Webhook arrives.
 2. `webhook.py` turns it into either:
-   - `full_review` for MR open/reopen/draft-to-ready
+   - `full_review` for MR open/reopen/draft-to-ready/new-commit push on a ready MR
    - `discussion_reconcile` for MR note events
 3. `store.py` enqueues the run in SQLite.
 4. Newer full-review runs supersede older queued/running runs on the same MR.
@@ -56,7 +56,7 @@ Supporting modules: `models.py` (frozen dataclasses), `config.py` (env vars), `t
 - Each MR has exactly one summary bot note.
 - Findings can also have their own tracked GitLab discussions.
 - Only one full-review SHA per MR is active at a time; newer full reviews supersede older queued/running ones.
-- Push events to an already-open MR still do not auto-trigger a full review.
+- Push events to an already-open ready MR do auto-trigger a full review.
 - Note events can trigger lightweight reconciliation when GitLab `note_events` are enabled.
 - Human-owned threads are reply-only; the bot never resolves them.
 - Bot-owned threads may be resolved automatically when a human explanation dismisses the concern.

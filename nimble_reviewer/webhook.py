@@ -39,7 +39,10 @@ def parse_merge_request_event(payload: dict) -> ReviewRequestEvent | None:
     if action != "update":
         return None
 
-    if _became_ready(attributes, payload):
+    if work_in_progress:
+        return None
+
+    if _became_ready(attributes, payload) or _commit_pushed(payload):
         return _build_merge_request_event(payload, attributes, action, source_sha)
 
     return None
@@ -130,6 +133,14 @@ def _safe_int(value) -> int | None:
         return int(value)
     except (TypeError, ValueError):
         return None
+
+
+def _commit_pushed(payload: dict) -> bool:
+    changes = payload.get("changes") or {}
+    last_commit = changes.get("last_commit") or {}
+    previous = last_commit.get("previous") or last_commit.get("before")
+    current = last_commit.get("current") or last_commit.get("after")
+    return bool(previous and current and previous != current)
 
 
 def _became_ready(attributes: dict, payload: dict) -> bool:

@@ -130,11 +130,20 @@ class FakeGitLabClient:
 
 
 class FakeRepoManager:
-    def __init__(self, workspace: Path, diff_text: str | None = None, changed_files=None, review_rules_path=None, review_rules_text=None):
+    def __init__(
+        self,
+        workspace: Path,
+        diff_text: str | None = None,
+        changed_files=None,
+        review_rules_path=None,
+        review_rules_text=None,
+        incremental_diff_text: str | None = None,
+    ):
         self.workspace = workspace
         self.review_rules_path = review_rules_path
         self.review_rules_text = review_rules_text
         self.prepare_calls = []
+        self.prepare_previous_reviewed_shas = []
         self.diff_text = diff_text or (
             "diff --git a/file.py b/file.py\n"
             "--- a/file.py\n"
@@ -144,9 +153,11 @@ class FakeRepoManager:
             "+second line\n"
         )
         self.changed_files = changed_files or ["file.py"]
+        self.incremental_diff_text = incremental_diff_text
 
-    def prepare_checkout(self, repo_http_url, source_sha, target_branch, trace=None):
+    def prepare_checkout(self, repo_http_url, source_sha, target_branch, trace=None, previous_reviewed_sha=None):
         self.prepare_calls.append((repo_http_url, source_sha, target_branch))
+        self.prepare_previous_reviewed_shas.append(previous_reviewed_sha)
         return PreparedCheckout(
             path=self.workspace,
             merge_base="base123",
@@ -155,6 +166,8 @@ class FakeRepoManager:
             review_rules_path=self.review_rules_path,
             review_rules_text=self.review_rules_text,
             cleanup=lambda: None,
+            incremental_diff_text=self.incremental_diff_text,
+            previous_reviewed_sha=previous_reviewed_sha,
         )
 
 
@@ -401,6 +414,170 @@ class ReviewServiceTests(unittest.TestCase):
 
         self.assertEqual(len(gitlab.discussions), 1)
         self.assertIsNone(gitlab.summary_note)
+
+    def test_incremental_diff_uses_last_full_review_sha_not_latest_reconcile_sha(self):
+        workspace = Path(self.tmpdir.name)
+        (workspace / "file.py").write_text("new line\nsecond line\n", encoding="utf-8")
+        gitlab = FakeGitLabClient()
+        repo_manager = FakeRepoManager(workspace, incremental_diff_text="@@ -1 +1 @@\n+delta\n")
+        review_agent = FakeReviewAgentRunner(
+            result=ReviewResult(
+                summary="One issue found.",
+                overall_risk="medium",
+                findings=(ReviewFinding("medium", "file.py", 1, "Bug", "Needs fixing"),),
+            )
+        )
+        service = self._service(gitlab, repo_manager, review_agent)
+
+        self.store.enqueue_run(1, 2, "sha1", None)
+        first_run = self.store.claim_next_run()
+        service.process_run(first_run)
+
+        for index, discussion in enumerate(gitlab.discussions):
+            gitlab.discussions[index] = GitLabDiscussion(
+                id=discussion.id,
+                individual_note=discussion.individual_note,
+                notes=tuple([*discussion.notes, GitLabNote(id=701, body="I think this is fine.", author_id=123)]),
+                resolved=discussion.resolved,
+                resolvable=discussion.resolvable,
+                position=discussion.position,
+            )
+
+        gitlab.mr_info = MergeRequestInfo(
+            project_id=1,
+            mr_iid=2,
+            title="Title",
+            description="Description",
+            source_branch="feature",
+            target_branch="main",
+            source_sha="sha2",
+            web_url=gitlab.mr_info.web_url,
+            repo_http_url=gitlab.mr_info.repo_http_url,
+        )
+        self.store.enqueue_run(
+            1,
+            2,
+            "sha2",
+            None,
+            kind="discussion_reconcile",
+            trigger_discussion_id=gitlab.discussions[0].id,
+            trigger_note_id=701,
+            trigger_author_id=123,
+        )
+        reconcile_run = self.store.claim_next_run()
+        service.process_run(reconcile_run)
+
+        gitlab.mr_info = MergeRequestInfo(
+            project_id=1,
+            mr_iid=2,
+            title="Title",
+            description="Description",
+            source_branch="feature",
+            target_branch="main",
+            source_sha="sha3",
+            web_url=gitlab.mr_info.web_url,
+            repo_http_url=gitlab.mr_info.repo_http_url,
+        )
+        self.store.enqueue_run(1, 2, "sha3", None)
+        third_run = self.store.claim_next_run()
+        service.process_run(third_run)
+
+        self.assertEqual(repo_manager.prepare_previous_reviewed_shas, [None, None, "sha1"])
+        self.assertIn("Changes since the previous full review (since sha1):", review_agent.last_prompt)
+
+    def test_still_present_reply_is_posted_once_per_silent_streak(self):
+        workspace = Path(self.tmpdir.name)
+        (workspace / "file.py").write_text("new line\nsecond line\n", encoding="utf-8")
+        far_away_diff = (
+            "diff --git a/file.py b/file.py\n"
+            "--- a/file.py\n"
+            "+++ b/file.py\n"
+            "@@ -10,0 +10,1 @@\n"
+            "+touched later line\n"
+        )
+        gitlab = FakeGitLabClient()
+        first_service = self._service(
+            gitlab,
+            FakeRepoManager(workspace, diff_text=far_away_diff),
+            FakeReviewAgentRunner(
+                result=ReviewResult(
+                    summary="One issue found.",
+                    overall_risk="medium",
+                    findings=(ReviewFinding("medium", "file.py", 1, "Bug", "Needs fixing"),),
+                )
+            ),
+        )
+
+        self.store.enqueue_run(1, 2, "sha1", None)
+        first_run = self.store.claim_next_run()
+        first_service.process_run(first_run)
+
+        for sha in ("sha2", "sha3"):
+            gitlab.mr_info = MergeRequestInfo(
+                project_id=1,
+                mr_iid=2,
+                title="Title",
+                description="Description",
+                source_branch="feature",
+                target_branch="main",
+                source_sha=sha,
+                web_url=gitlab.mr_info.web_url,
+                repo_http_url=gitlab.mr_info.repo_http_url,
+            )
+            service = self._service(
+                gitlab,
+                FakeRepoManager(workspace, diff_text=far_away_diff),
+                FakeReviewAgentRunner(
+                    result=ReviewResult(
+                        summary="Same issue remains.",
+                        overall_risk="medium",
+                        findings=(ReviewFinding("medium", "file.py", 1, "Bug", "Needs fixing"),),
+                    )
+                ),
+            )
+            self.store.enqueue_run(1, 2, sha, None)
+            run = self.store.claim_next_run()
+            service.process_run(run)
+
+        self.assertEqual(len(gitlab.discussions[0].notes), 2)
+        self.assertIn("Reviewed `sha2` - no changes in this area since the last review. Concern still applies.", gitlab.discussions[0].notes[-1].body)
+
+        gitlab.discussions[0] = GitLabDiscussion(
+            id=gitlab.discussions[0].id,
+            individual_note=gitlab.discussions[0].individual_note,
+            notes=tuple([*gitlab.discussions[0].notes, GitLabNote(id=702, body="Please re-check after rebase.", author_id=123)]),
+            resolved=gitlab.discussions[0].resolved,
+            resolvable=gitlab.discussions[0].resolvable,
+            position=gitlab.discussions[0].position,
+        )
+        gitlab.mr_info = MergeRequestInfo(
+            project_id=1,
+            mr_iid=2,
+            title="Title",
+            description="Description",
+            source_branch="feature",
+            target_branch="main",
+            source_sha="sha4",
+            web_url=gitlab.mr_info.web_url,
+            repo_http_url=gitlab.mr_info.repo_http_url,
+        )
+        service = self._service(
+            gitlab,
+            FakeRepoManager(workspace, diff_text=far_away_diff),
+            FakeReviewAgentRunner(
+                result=ReviewResult(
+                    summary="Same issue remains.",
+                    overall_risk="medium",
+                    findings=(ReviewFinding("medium", "file.py", 1, "Bug", "Needs fixing"),),
+                )
+            ),
+        )
+        self.store.enqueue_run(1, 2, "sha4", None)
+        fourth_run = self.store.claim_next_run()
+        service.process_run(fourth_run)
+
+        self.assertEqual(len(gitlab.discussions[0].notes), 4)
+        self.assertIn("Reviewed `sha4` - no changes in this area since the last review. Concern still applies.", gitlab.discussions[0].notes[-1].body)
 
     def test_full_review_resolves_bot_owned_discussion_when_finding_disappears(self):
         workspace = Path(self.tmpdir.name)

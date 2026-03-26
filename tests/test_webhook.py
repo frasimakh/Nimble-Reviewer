@@ -59,6 +59,29 @@ class ParseWebhookEventTests(unittest.TestCase):
         event = parse_merge_request_event(payload)
         self.assertIsNotNone(event)
 
+    def test_update_with_new_commit_triggers_full_review(self):
+        payload = _mr_payload("update")
+        payload["changes"] = {
+            "last_commit": {"previous": {"id": "old123"}, "current": {"id": "new456"}},
+        }
+        payload["object_attributes"]["last_commit"] = {"id": "new456"}
+        event = parse_merge_request_event(payload)
+        self.assertIsNotNone(event)
+        self.assertEqual(event.kind, "full_review")
+        self.assertEqual(event.source_sha, "new456")
+
+    def test_update_with_new_commit_ignored_when_draft(self):
+        payload = _mr_payload("update", work_in_progress=True)
+        payload["changes"] = {
+            "last_commit": {"previous": {"id": "old123"}, "current": {"id": "new456"}},
+        }
+        event = parse_merge_request_event(payload)
+        self.assertIsNone(event)
+
+    def test_update_without_new_commit_or_ready_transition_is_ignored(self):
+        event = parse_merge_request_event(_mr_payload("update"))
+        self.assertIsNone(event)
+
     def test_note_hook_for_merge_request_creates_reconcile_event(self):
         event = parse_note_event(_note_payload(), bot_user_id=900)
         self.assertIsNotNone(event)

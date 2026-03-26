@@ -34,6 +34,7 @@ from nimble_reviewer.trace import RunTrace, TraceSettings
 LOGGER = logging.getLogger(__name__)
 
 FINDING_MARKER_PREFIX = "<!-- nimble-reviewer:finding:"
+STILL_PRESENT_MARKER_PREFIX = "<!-- nimble-reviewer:still-present:"
 
 
 @dataclass(frozen=True)
@@ -130,11 +131,15 @@ class ReviewService:
                 LOGGER.info("Run %s is stale; GitLab head is now %s", run.id, mr_info.source_sha)
                 return
 
+            previous_full_review = self.store.get_latest_done_run(run.project_id, run.mr_iid, kind="full_review")
+            previous_reviewed_sha = previous_full_review.source_sha if previous_full_review else None
+
             checkout = self.repo_manager.prepare_checkout(
                 mr_info.repo_http_url,
                 mr_info.source_sha,
                 mr_info.target_branch,
                 trace=trace,
+                previous_reviewed_sha=previous_reviewed_sha,
             )
             try:
                 discussions = self.gitlab.list_merge_request_discussions(run.project_id, run.mr_iid)
@@ -148,12 +153,18 @@ class ReviewService:
                     repo_rules_text=checkout.review_rules_text,
                     repo_rules_path=checkout.review_rules_path,
                     repo_rules_truncated=checkout.review_rules_truncated,
+                    incremental_diff_text=checkout.incremental_diff_text,
+                    previous_reviewed_sha=checkout.previous_reviewed_sha,
                 )
                 result = self.review_agent.review(prompt, checkout.path, trace=trace)
                 result = _enrich_result_for_rendering(result, checkout.path)
                 diff_mapping = build_diff_mapping(checkout.diff_text)
                 result = _suppress_dismissed_findings(result, tracked_findings, diff_mapping)
-                previous_result = self._load_previous_success_result(run, kind="full_review")
+                previous_result = self._load_previous_success_result(
+                    run,
+                    kind="full_review",
+                    previous_run=previous_full_review,
+                )
                 comparison = _build_review_comparison(previous_result, result)
                 if trace:
                     trace.write_snapshot("review.final", _review_result_snapshot_payload(result))
@@ -448,6 +459,27 @@ class ReviewService:
                 )
             )
 
+            existing_discussion = discussions_by_id.get(discussion_id) if discussion_id else None
+            if (
+                finding_state.status == "still_present"
+                and thread_owner == "bot"
+                and discussion_id
+                and existing_discussion is not None
+                and not diff_mapping.has_changes_near(finding.file, finding.line)
+                and _should_add_still_present_reply(
+                    existing_discussion,
+                    source_sha=source_sha,
+                    fingerprint=tracked.fingerprint,
+                    bot_user_id=bot_user_id,
+                )
+            ):
+                self.gitlab.add_discussion_note(
+                    project_id,
+                    mr_iid,
+                    discussion_id,
+                    _render_still_present_reply(source_sha, tracked.fingerprint),
+                )
+
         resolved_count = 0
         for tracked in tracked_findings:
             if tracked.status != "open":
@@ -586,8 +618,15 @@ class ReviewService:
             return self.gitlab.update_note(project_id, mr_iid, existing.id, body)
         return self.gitlab.create_note(project_id, mr_iid, body)
 
-    def _load_previous_success_result(self, run: ReviewRun, *, kind: str) -> ReviewResult | None:
-        previous_run = self.store.get_latest_done_run(run.project_id, run.mr_iid, kind=kind)  # type: ignore[arg-type]
+    def _load_previous_success_result(
+        self,
+        run: ReviewRun,
+        *,
+        kind: str,
+        previous_run: ReviewRun | None = None,
+    ) -> ReviewResult | None:
+        if previous_run is None:
+            previous_run = self.store.get_latest_done_run(run.project_id, run.mr_iid, kind=kind)  # type: ignore[arg-type]
         if not previous_run:
             return None
         snapshot_path = self.trace_settings.directory / f"run-{previous_run.id}.review.final.json"
@@ -780,6 +819,13 @@ def _reply_with_marker(body: str, fingerprint: str, provider: str = "") -> str:
     return f"{prefix}{body.strip()}\n\n{_finding_marker(fingerprint)}"
 
 
+def _render_still_present_reply(source_sha: str, fingerprint: str) -> str:
+    return (
+        f"Reviewed `{source_sha[:8]}` - no changes in this area since the last review. "
+        f"Concern still applies.\n\n{_still_present_marker(fingerprint, source_sha)}"
+    )
+
+
 def _render_finding_thread_body(finding: ReviewFinding, fingerprint: str) -> str:
     provider_label, both_found = _format_provider_label(finding.sources)
     is_low_single = not both_found and finding.severity == "low"
@@ -815,6 +861,28 @@ def _render_thread_reply(finding: ReviewFinding) -> str:
 
 def _finding_marker(fingerprint: str) -> str:
     return f"{FINDING_MARKER_PREFIX}{fingerprint} -->"
+
+
+def _still_present_marker(fingerprint: str, source_sha: str) -> str:
+    return f"{STILL_PRESENT_MARKER_PREFIX}{fingerprint}:{source_sha[:8]} -->"
+
+
+def _should_add_still_present_reply(
+    discussion: GitLabDiscussion,
+    *,
+    source_sha: str,
+    fingerprint: str,
+    bot_user_id: int,
+) -> bool:
+    marker = _still_present_marker(fingerprint, source_sha)
+    if any(marker in note.body for note in discussion.notes):
+        return False
+
+    for note in reversed(discussion.notes[1:]):
+        if note.system:
+            continue
+        return note.author_id != bot_user_id
+    return True
 
 
 def _metrics_from_tracked_findings(tracked_findings: list[TrackedFinding]) -> ReviewSummaryMetrics:

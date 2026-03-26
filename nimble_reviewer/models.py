@@ -213,6 +213,8 @@ class PreparedCheckout:
     review_rules_path: str | None = None
     review_rules_text: str | None = None
     review_rules_truncated: bool = False
+    incremental_diff_text: str | None = None
+    previous_reviewed_sha: str | None = None
 
     def close(self) -> None:
         self.cleanup()

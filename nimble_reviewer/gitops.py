@@ -31,6 +31,7 @@ class RepoManager:
         source_sha: str,
         target_branch: str,
         trace: RunTrace | None = None,
+        previous_reviewed_sha: str | None = None,
     ) -> PreparedCheckout:
         LOGGER.info(
             "Preparing checkout repo=%s sha=%s target_branch=%s",
@@ -59,6 +60,20 @@ class RepoManager:
             for line in self._capture_git(["diff", "--name-only", f"{merge_base}..HEAD"], cwd=checkout_dir).splitlines()
             if line.strip()
         ]
+        incremental_diff_text: str | None = None
+        if previous_reviewed_sha and previous_reviewed_sha != source_sha:
+            try:
+                incremental_diff_text = self._capture_git(
+                    ["diff", "--unified=3", f"{previous_reviewed_sha}..HEAD"],
+                    cwd=checkout_dir,
+                )
+            except GitError:
+                LOGGER.warning(
+                    "Could not compute incremental diff from %s to %s; skipping",
+                    previous_reviewed_sha[:12],
+                    source_sha[:12],
+                )
+
         review_rules = load_repo_review_rules(checkout_dir)
         LOGGER.info(
             "Prepared checkout dir=%s merge_base=%s changed_files=%s diff_bytes=%s review_rules=%s",
@@ -88,6 +103,8 @@ class RepoManager:
             review_rules_text=review_rules.text if review_rules else None,
             review_rules_truncated=review_rules.truncated if review_rules else False,
             cleanup=lambda: shutil.rmtree(checkout_dir, ignore_errors=True),
+            incremental_diff_text=incremental_diff_text or None,
+            previous_reviewed_sha=previous_reviewed_sha,
         )
 
     def _ensure_mirror(self, repo_http_url: str) -> Path:

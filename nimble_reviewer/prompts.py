@@ -17,6 +17,8 @@ def build_review_prompt(
     repo_rules_text: str | None = None,
     repo_rules_path: str | None = None,
     repo_rules_truncated: bool = False,
+    incremental_diff_text: str | None = None,
+    previous_reviewed_sha: str | None = None,
 ) -> str:
     truncated = False
     if len(diff_text) > MAX_DIFF_CHARS:
@@ -45,6 +47,17 @@ Open and recent merge request discussion context:
 ```md
 {discussion_digest[:MAX_DISCUSSION_CHARS]}
 ```
+"""
+
+    incremental_diff_section = ""
+    if incremental_diff_text and previous_reviewed_sha:
+        short_sha = previous_reviewed_sha[:12]
+        incremental_diff_section = f"""
+Changes since the previous full review (since {short_sha}):
+```diff
+{incremental_diff_text[:MAX_DIFF_CHARS]}
+```
+Focus your review primarily on these incremental changes. Use the full diff below as context, but avoid re-reporting concerns that were already visible in the previous full review and have not changed.
 """
     truncation_notice = (
         "\nThe diff was truncated to fit the review budget. Focus on the visible diff and use repository context as needed.\n"
@@ -97,8 +110,8 @@ Description:
 
 Changed files:
 {changed_files_text}
-{truncation_notice}
-Unified diff:
+{incremental_diff_section}{truncation_notice}
+Unified diff (full, base → HEAD):
 ```diff
 {diff_text}
 ```"""
@@ -123,13 +136,13 @@ Return only strict JSON with this shape:
 }}
 
 Rules:
-- `dismissed_by_discussion` means the human explanation convincingly resolves the bot concern.
-- Use `dismissed_by_discussion` only when the discussion contains a concrete technical explanation that removes the risk.
-- Use `reply_only` when the bot should respond but the concern should remain open or unresolved.
-- Use `keep_open` when the thread should stay open without any bot reply.
-- Use `no_action` when the note is irrelevant, too weak, or too ambiguous to act on.
+- `dismissed_by_discussion`: the human explanation convincingly resolves the concern. Always include `reply_body` — a brief natural acknowledgment, e.g. "Fixed, agreed — closing this." or "Makes sense, thanks."
+- `reply_only`: concern stays open but the bot should respond. Always include `reply_body` explaining what still needs attention.
+- `keep_open`: concern still stands and someone addressed the bot. Always include `reply_body` — explain briefly and specifically why the concern remains, as a colleague would in a code review.
+- `no_action`: the note is clearly irrelevant, off-topic, or bot-authored noise — skip entirely, no `reply_body`.
+- Use `dismissed_by_discussion` only when the discussion contains a concrete technical explanation that removes the risk. Do not dismiss on vague reassurances.
+- Write `reply_body` in plain, direct markdown. Be concise and natural — like a colleague in a code review, not a formal system message.
 - Keep `reason` short and specific.
-- Include `reply_body` only when the bot should actually post a reply.
 - Never ask for more information. Decide from the discussion context.
 
 Merge request:
