@@ -279,6 +279,8 @@ class ReviewService:
                     discussion_text=_render_discussion_context(discussion),
                     trigger_note_body=(trigger_note.body if trigger_note else discussion.root_note.body if discussion.root_note else ""),
                     linked_finding_payload=_tracked_finding_payload(tracked),
+                    diff_text=checkout.diff_text,
+                    finding_file=tracked.file,
                 )
                 payload, _ = self.discussion_reconcile_agent.run_json(prompt, checkout.path, trace=trace)
             finally:

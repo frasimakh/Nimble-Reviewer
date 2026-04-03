@@ -117,6 +117,22 @@ Unified diff (full, base → HEAD):
 ```"""
 
 
+MAX_RECONCILE_FILE_DIFF_CHARS = 20_000
+
+
+def _extract_file_diff(diff_text: str, file_path: str) -> str:
+    """Extract the diff section for a specific file from a unified diff."""
+    lines = diff_text.splitlines(keepends=True)
+    result: list[str] = []
+    in_file = False
+    for line in lines:
+        if line.startswith("diff --git"):
+            in_file = file_path in line
+        if in_file:
+            result.append(line)
+    return "".join(result)
+
+
 def build_discussion_reconcile_prompt(
     mr: MergeRequestInfo,
     *,
@@ -124,8 +140,24 @@ def build_discussion_reconcile_prompt(
     discussion_text: str,
     trigger_note_body: str,
     linked_finding_payload: dict | None,
+    diff_text: str | None = None,
+    finding_file: str | None = None,
 ) -> str:
     finding_json = json.dumps(linked_finding_payload or {}, indent=2, sort_keys=True)
+
+    diff_section = ""
+    if diff_text:
+        relevant_diff = _extract_file_diff(diff_text, finding_file) if finding_file else ""
+        if not relevant_diff:
+            relevant_diff = diff_text
+        relevant_diff = relevant_diff[:MAX_RECONCILE_FILE_DIFF_CHARS]
+        diff_section = f"""
+MR diff (use this to verify claims about what changed):
+```diff
+{relevant_diff}
+```
+"""
+
     return f"""You are reconciling a GitLab merge request discussion against an existing AI review finding.
 
 Return only strict JSON with this shape:
@@ -141,7 +173,9 @@ Rules:
 - `keep_open`: concern still stands and someone addressed the bot. Always include `reply_body` — explain briefly and specifically why the concern remains, as a colleague would in a code review.
 - `no_action`: the note is clearly irrelevant, off-topic, or bot-authored noise — skip entirely, no `reply_body`.
 - Use `dismissed_by_discussion` only when the discussion contains a concrete technical explanation that removes the risk. Do not dismiss on vague reassurances.
+- When the diff is available, verify the human's claim against it before deciding. If the diff confirms the fix, use `dismissed_by_discussion`. If the diff contradicts the claim, use `keep_open`.
 - Write `reply_body` in plain, direct markdown. Be concise and natural — like a colleague in a code review, not a formal system message.
+- Write `reply_body` in the same language as the human's latest note.
 - Keep `reason` short and specific.
 - Never ask for more information. Decide from the discussion context.
 
@@ -156,7 +190,7 @@ Tracked finding:
 ```json
 {finding_json}
 ```
-
+{diff_section}
 Discussion {discussion_id}:
 ```md
 {discussion_text[:MAX_DISCUSSION_CHARS]}
