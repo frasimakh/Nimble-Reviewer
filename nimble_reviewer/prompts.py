@@ -168,11 +168,11 @@ Return only strict JSON with this shape:
 }}
 
 Rules:
-- `dismissed_by_discussion`: the human explanation convincingly resolves the concern. Always include `reply_body` — a brief natural acknowledgment, e.g. "Fixed, agreed — closing this." or "Makes sense, thanks."
+- `dismissed_by_discussion`: use in two cases: (a) the human provides a concrete technical explanation that removes the risk, or (b) the human explicitly and clearly states the concern is not important, is acceptable risk, or they take responsibility for it. Always include `reply_body`. For case (a), acknowledge the fix naturally, e.g. "Makes sense, thanks." For case (b), acknowledge the decision gracefully, e.g. "Understood — closing this, it's your call." or "Fair enough, I won't push on this."
 - `reply_only`: concern stays open but the bot should respond. Always include `reply_body` explaining what still needs attention.
-- `keep_open`: concern still stands and someone addressed the bot. Always include `reply_body` — explain briefly and specifically why the concern remains, as a colleague would in a code review.
+- `keep_open`: the human replied but appears to have misunderstood or not fully engaged with the concern. Always include `reply_body` — re-explain briefly and specifically why the concern still stands, as a colleague would in a code review.
 - `no_action`: the note is clearly irrelevant, off-topic, or bot-authored noise — skip entirely, no `reply_body`.
-- Use `dismissed_by_discussion` only when the discussion contains a concrete technical explanation that removes the risk. Do not dismiss on vague reassurances.
+- Do not dismiss on vague or ambiguous reassurances. Distinguish between "this is not important to us" (explicit acceptance — use `dismissed_by_discussion`) and an incomplete or tangential reply (use `keep_open`).
 - When the diff is available, verify the human's claim against it before deciding. If the diff confirms the fix, use `dismissed_by_discussion`. If the diff contradicts the claim, use `keep_open`.
 - Write `reply_body` in plain, direct markdown. Be concise and natural — like a colleague in a code review, not a formal system message.
 - Write `reply_body` in the same language as the human's latest note.
