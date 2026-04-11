@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 import time
 from dataclasses import dataclass, replace as dc_replace
 from pathlib import Path
@@ -24,7 +25,13 @@ from nimble_reviewer.models import (
     ThreadOwner,
     TrackedFinding,
 )
-from nimble_reviewer.prompts import build_discussion_reconcile_prompt, build_review_prompt
+from nimble_reviewer.prompts import (
+    HUNK_CONTEXT_LINES,
+    MAX_HUNK_CONTEXT_CHARS_PER_FILE,
+    MAX_HUNK_CONTEXT_FILES,
+    build_discussion_reconcile_prompt,
+    build_review_prompt,
+)
 from nimble_reviewer.review_agent import JsonCapableReviewAgent, ReviewAgentRunner, _review_result_from_payload
 from nimble_reviewer.store import Store
 from nimble_reviewer.trace import RunTrace, TraceSettings
@@ -100,7 +107,7 @@ class ReviewService:
         Checks staleness twice — once before the expensive LLM call and once
         immediately before publishing — and aborts with ``superseded`` if the
         MR head has moved on either check.  On any unhandled error the run is
-        marked ``failed`` and a failure note is posted to the MR.
+        marked ``failed``.
         """
         LOGGER.info(
             "Starting full review run_id=%s project=%s mr=%s sha=%s",
@@ -143,6 +150,7 @@ class ReviewService:
                 tracked_findings = self.store.list_tracked_findings(run.project_id, run.mr_iid)
                 discussion_digest = _build_discussion_digest(discussions, checkout.changed_files, tracked_findings)
                 discussion_inventory = _build_discussion_inventory(discussions)
+                hunk_context = _build_hunk_context(checkout.diff_text, checkout.path)
                 prompt = build_review_prompt(
                     mr_info,
                     checkout.diff_text,
@@ -154,6 +162,7 @@ class ReviewService:
                     repo_rules_truncated=checkout.review_rules_truncated,
                     incremental_diff_text=checkout.incremental_diff_text,
                     previous_reviewed_sha=checkout.previous_reviewed_sha,
+                    hunk_context=hunk_context,
                 )
                 result = self.review_agent.review(prompt, checkout.path, trace=trace)
                 result = _enrich_result_for_rendering(result, checkout.path)
@@ -230,8 +239,7 @@ class ReviewService:
 
         Looks up the tracked finding linked to *run.trigger_discussion_id*,
         asks the reconcile agent for a decision, then either dismisses the
-        finding, adds a bot reply, or leaves it open.  The summary note is
-        refreshed to reflect any status change.
+        finding, adds a bot reply, or leaves it open.
         """
         LOGGER.info(
             "Starting discussion reconcile run_id=%s project=%s mr=%s discussion=%s note=%s provider=%s",
@@ -275,6 +283,8 @@ class ReviewService:
                     linked_finding_payload=_tracked_finding_payload(tracked),
                     diff_text=checkout.diff_text,
                     finding_file=tracked.file,
+                    repo_rules_text=checkout.review_rules_text,
+                    repo_rules_path=checkout.review_rules_path,
                 )
                 payload, _ = self.discussion_reconcile_agent.run_json(prompt, checkout.path, trace=trace)
             finally:
@@ -946,6 +956,55 @@ def _enrich_finding(finding: ReviewFinding, checkout_path: Path) -> ReviewFindin
         snippet_start_line=max(1, finding.line - 2) if snippet else None,
         snippet_language=_guess_language(finding.file),
     )
+
+
+def _build_hunk_context(diff_text: str, checkout_path: Path) -> dict[str, str]:
+    """Read surrounding file context for each changed hunk.
+
+    Returns {file_path: rendered snippet} for files found in the checkout.
+    Snippets show HUNK_CONTEXT_LINES lines above and below each hunk start,
+    with ``...`` separators between non-adjacent ranges.
+    """
+    file_lines: dict[str, list[int]] = {}
+    current_file: str | None = None
+    for line in diff_text.splitlines():
+        if line.startswith("+++ b/"):
+            current_file = line[6:].strip()
+            file_lines.setdefault(current_file, [])
+        elif line.startswith("@@ ") and current_file is not None:
+            m = re.search(r"\+(\d+)", line)
+            if m:
+                file_lines[current_file].append(int(m.group(1)))
+
+    result: dict[str, str] = {}
+    for file_path, hunk_starts in list(file_lines.items())[:MAX_HUNK_CONTEXT_FILES]:
+        full_path = checkout_path / file_path
+        if not full_path.is_file():
+            continue
+        try:
+            content = full_path.read_text(encoding="utf-8", errors="replace").splitlines()
+        except OSError:
+            continue
+        if not content:
+            continue
+
+        ranges: set[int] = set()
+        for ln in hunk_starts:
+            lo = max(0, ln - HUNK_CONTEXT_LINES - 1)
+            hi = min(len(content), ln + HUNK_CONTEXT_LINES)
+            ranges.update(range(lo, hi))
+
+        snippet_lines: list[str] = []
+        prev: int | None = None
+        for i in sorted(ranges):
+            if prev is not None and i > prev + 1:
+                snippet_lines.append("...")
+            snippet_lines.append(f"{i + 1:5d} | {content[i]}")
+            prev = i
+
+        result[file_path] = "\n".join(snippet_lines)[:MAX_HUNK_CONTEXT_CHARS_PER_FILE]
+
+    return result
 
 
 def _guess_language(file_path: str) -> str | None:

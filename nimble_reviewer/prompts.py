@@ -1,12 +1,17 @@
 from __future__ import annotations
 
 import json
+import re
 
 from nimble_reviewer.models import MergeRequestInfo, ReviewResult
 
 
 MAX_DIFF_CHARS = 200_000
 MAX_DISCUSSION_CHARS = 40_000
+MAX_HUNK_CONTEXT_CHARS = 40_000
+MAX_HUNK_CONTEXT_CHARS_PER_FILE = 3_000
+MAX_HUNK_CONTEXT_FILES = 15
+HUNK_CONTEXT_LINES = 25
 
 
 def build_review_prompt(
@@ -20,6 +25,7 @@ def build_review_prompt(
     repo_rules_truncated: bool = False,
     incremental_diff_text: str | None = None,
     previous_reviewed_sha: str | None = None,
+    hunk_context: dict[str, str] | None = None,
 ) -> str:
     truncated = False
     if len(diff_text) > MAX_DIFF_CHARS:
@@ -67,6 +73,18 @@ Changes since the previous full review (since {short_sha}):
 ```
 Focus your review primarily on these incremental changes. Use the full diff below as context, but avoid re-reporting concerns that were already visible in the previous full review and have not changed.
 """
+    hunk_context_section = ""
+    if hunk_context:
+        parts: list[str] = []
+        total = 0
+        for file_path, snippet in hunk_context.items():
+            if total + len(snippet) > MAX_HUNK_CONTEXT_CHARS:
+                break
+            parts.append(f"**{file_path}**\n```\n{snippet}\n```")
+            total += len(snippet)
+        if parts:
+            hunk_context_section = "\nSurrounding file context (lines around each changed area):\n" + "\n\n".join(parts) + "\n"
+
     truncation_notice = (
         "\nThe diff was truncated to fit the review budget. Focus on the visible diff and use repository context as needed.\n"
         if truncated
@@ -119,7 +137,7 @@ Description:
 
 Changed files:
 {changed_files_text}
-{incremental_diff_section}{truncation_notice}
+{incremental_diff_section}{hunk_context_section}{truncation_notice}
 Unified diff (full, base → HEAD):
 ```diff
 {diff_text}
@@ -151,8 +169,20 @@ def build_discussion_reconcile_prompt(
     linked_finding_payload: dict | None,
     diff_text: str | None = None,
     finding_file: str | None = None,
+    repo_rules_text: str | None = None,
+    repo_rules_path: str | None = None,
 ) -> str:
     finding_json = json.dumps(linked_finding_payload or {}, indent=2, sort_keys=True)
+
+    repo_rules_section = ""
+    if repo_rules_text:
+        repo_rules_section = f"""
+Repository-specific review rules from `{repo_rules_path or "repository rules file"}`:
+```md
+{repo_rules_text}
+```
+Use these rules when judging whether a human's dismissal is acceptable or whether the concern should stay open.
+"""
 
     diff_section = ""
     if diff_text:
@@ -194,7 +224,7 @@ Merge request:
 - Title: {mr.title}
 - Source SHA: {mr.source_sha}
 - Web URL: {mr.web_url}
-
+{repo_rules_section}
 Tracked finding:
 ```json
 {finding_json}

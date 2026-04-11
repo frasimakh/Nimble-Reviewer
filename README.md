@@ -3,10 +3,9 @@
 Containerized GitLab merge request review bot. The service accepts GitLab merge request and note webhooks, queues persisted review runs in SQLite, checks out the MR, runs Codex and Claude Code reviews in parallel, then publishes:
 
 - GitLab discussion threads for findings, inline when possible and top-level otherwise
-- a temporary failure note when a review run fails
 - lightweight discussion reconciliation when humans reply in MR threads
 
-Full review runs are triggered when a non-draft MR is opened or reopened, and when an existing MR moves from draft to ready. Pushes to an already-open MR still do not trigger an automatic full re-review. Human comments in merge request discussions can trigger a lightweight `discussion_reconcile` run when GitLab `note_events` are enabled.
+Full review runs are triggered when a non-draft MR is opened or reopened, when an existing MR moves from draft to ready, and when new commits are pushed to an already-open ready MR. Human comments in merge request discussions can trigger a lightweight `discussion_reconcile` run when GitLab `note_events` are enabled.
 
 ## Repository-specific review rules
 
@@ -54,7 +53,7 @@ The synthesized findings are then published as:
 - top-level merge request discussions when the finding cannot be anchored safely
 - replies in relevant human threads when the concern matches an existing discussion
 
-There is no persistent success note for completed reviews. If a run fails, the bot may leave a short failure note on the MR; the next successful full review deletes that note.
+There is no persistent note for completed reviews — findings live in their own discussion threads.
 
 ### Discussion reconcile
 
@@ -78,7 +77,6 @@ The service stores three kinds of state in SQLite.
 | column | description |
 |---|---|
 | `project_id`, `mr_iid` | primary key |
-| `summary_note_id` | GitLab note ID of the bot's summary comment |
 | `last_seen_sha` | latest commit the service has observed |
 | `last_reviewed_sha` | last commit where a full review completed successfully |
 
@@ -143,6 +141,7 @@ Enqueue rules:
 - Open discussion digest: a summary of unresolved threads on changed files with all their notes, so the council knows what is already under discussion
 - List of changed files
 - Incremental diff, labelled "focus primarily on these changes", so the council avoids re-reporting concerns from unchanged code
+- Surrounding file context: lines around each changed hunk read from the checkout, so the council sees the full function/class context beyond the diff
 - Full unified diff (capped at 200 k characters)
 
 The council returns JSON:
@@ -175,8 +174,6 @@ For each finding in the council result:
 Findings that appeared in the previous review and are still present get a "still present at `<sha>`" reply added to their thread. The reply includes a hidden marker so it is never duplicated across runs.
 
 Findings from the previous review that are no longer present are resolved: their `tracked_finding` status is set to `resolved` and the GitLab discussion is marked resolved.
-
-The single summary note for the MR is upserted after every full review. It shows the overall risk, finding counts (new, still present, resolved, dismissed), and a brief council summary.
 
 ## Discussion reconcile — detailed flow
 
