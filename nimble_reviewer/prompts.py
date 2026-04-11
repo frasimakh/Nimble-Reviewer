@@ -119,6 +119,7 @@ Rules:
 - Use repository context when needed, but keep the final output concise and structured.
 - Consider existing MR discussion context. Do not restate concerns that have already been convincingly dismissed by discussion unless the visible diff reintroduces the risk.
 - Follow repository-specific review rules when provided, unless they conflict with the JSON output contract above.
+- If repository rules specify a language for output, write all text fields (title, body, summary, suggestion) in that language.
 
 Merge request metadata:
 - Project ID: {mr.project_id}
@@ -297,6 +298,7 @@ Rules:
 - Fill `reviewer_overview.codex` and `reviewer_overview.claude` with short reviewer-specific notes describing what each model independently surfaced, emphasized, or agreed with.
 - Do not repeat or paraphrase the full base-review summaries inside `summary`; use `reviewer_overview` for reviewer-specific attribution.
 - Prefer highlighting overlap and unique findings explicitly, e.g. one reviewer confirmed a shared issue while the other added an extra concern.
+- Match the language of the base reviews for all text fields (title, body, summary, suggestion). If the base reviews are in a non-English language, preserve that language in the final output.
 
 Original review brief:
 {base_review_prompt}
