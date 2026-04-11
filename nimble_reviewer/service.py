@@ -809,8 +809,8 @@ def _format_provider_label(sources: tuple) -> tuple[str, bool]:
 
 def _reply_with_marker(body: str, fingerprint: str, provider: str = "") -> str:
     label = {"codex": "Codex ֎", "claude": "Claude ✴️"}.get(provider, "")
-    prefix = f"{label}\n\n" if label else ""
-    return f"{prefix}{body.strip()}\n\n{_finding_marker(fingerprint)}"
+    suffix = f"\n\nBy {label}" if label else ""
+    return f"{body.strip()}{suffix}\n\n{_finding_marker(fingerprint)}"
 
 
 def _render_still_present_reply(source_sha: str, fingerprint: str) -> str:
