@@ -256,6 +256,12 @@ class ReviewService:
             discussions = self.gitlab.list_merge_request_discussions(run.project_id, run.mr_iid)
             discussion = _find_discussion(discussions, run.trigger_discussion_id, run.trigger_note_id)
             if discussion is None:
+                LOGGER.info(
+                    "Reconcile run_id=%s skipped: discussion %s not found among %d discussions",
+                    run.id,
+                    run.trigger_discussion_id,
+                    len(discussions),
+                )
                 self.store.mark_done(run.id, run.project_id, run.mr_iid, mr_info.source_sha)
                 return
 
@@ -263,7 +269,21 @@ class ReviewService:
             tracked = self.store.get_tracked_finding_by_discussion(run.project_id, run.mr_iid, discussion.id)
             if tracked is None:
                 tracked = _match_discussion_to_tracked_finding(discussion, tracked_findings)
-            if tracked is None or tracked.status != "open":
+            if tracked is None:
+                LOGGER.info(
+                    "Reconcile run_id=%s skipped: no tracked finding matched discussion %s",
+                    run.id,
+                    discussion.id,
+                )
+                self.store.mark_done(run.id, run.project_id, run.mr_iid, mr_info.source_sha)
+                return
+            if tracked.status != "open":
+                LOGGER.info(
+                    "Reconcile run_id=%s skipped: finding %s is already %s",
+                    run.id,
+                    tracked.fingerprint[:12],
+                    tracked.status,
+                )
                 self.store.mark_done(run.id, run.project_id, run.mr_iid, mr_info.source_sha)
                 return
 
