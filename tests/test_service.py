@@ -858,36 +858,6 @@ class ReviewServiceTests(unittest.TestCase):
         self.assertEqual(gitlab.discussions[1].root_note.author_id, gitlab.current_user.id)
 
 
-    def test_failure_note_is_deleted_on_next_successful_run(self):
-        # A transient failure leaves a "Review failed" note on the MR.
-        # The next successful run should delete it so it doesn't linger.
-        workspace = Path(self.tmpdir.name)
-        (workspace / "file.py").write_text("new line\nsecond line\n", encoding="utf-8")
-        gitlab = FakeGitLabClient()
-
-        # Simulate a pre-existing failure note left by a previous run.
-        from nimble_reviewer.renderer import note_marker
-        failure_body = note_marker(1, 2) + "\nReview failed: some transient error"
-        gitlab.summary_note = GitLabNote(id=55, body=failure_body, author_id=gitlab.current_user.id)
-
-        service = self._service(
-            gitlab,
-            FakeRepoManager(workspace),
-            FakeReviewAgentRunner(
-                result=ReviewResult(
-                    summary="All good.",
-                    overall_risk="low",
-                    findings=(),
-                )
-            ),
-        )
-        self.store.enqueue_run(1, 2, "sha1", None)
-        run = self.store.claim_next_run()
-        service.process_run(run)
-
-        stored_run = self.store.get_run(run.id)
-        self.assertEqual(stored_run.status, "done")
-        self.assertIsNone(gitlab.summary_note)  # failure note was deleted
 
 
 if __name__ == "__main__":

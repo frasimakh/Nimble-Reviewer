@@ -20,13 +20,11 @@ from nimble_reviewer.models import (
     ReviewParticipant,
     ReviewResult,
     ReviewRun,
-    ReviewSummaryMetrics,
     ReviewTokenUsage,
     ThreadOwner,
     TrackedFinding,
 )
 from nimble_reviewer.prompts import build_discussion_reconcile_prompt, build_review_prompt
-from nimble_reviewer.renderer import note_marker, render_failure_note, render_success_note
 from nimble_reviewer.review_agent import JsonCapableReviewAgent, ReviewAgentRunner, _review_result_from_payload
 from nimble_reviewer.store import Store
 from nimble_reviewer.trace import RunTrace, TraceSettings
@@ -57,7 +55,6 @@ class _PublishedFinding:
 
 @dataclass(frozen=True)
 class _PublishedReviewState:
-    metrics: ReviewSummaryMetrics
     current_states: tuple[ReviewFindingState, ...]
 
 
@@ -204,7 +201,6 @@ class ReviewService:
                 LOGGER.info("Run %s became stale during inline publish", run.id)
                 return
 
-            self._delete_bot_note_if_present(run.project_id, run.mr_iid)
             self.store.mark_done(run.id, run.project_id, run.mr_iid, mr_info.source_sha)
             LOGGER.info(
                 "Completed full review run_id=%s total_sec=%.2f",
@@ -225,11 +221,7 @@ class ReviewService:
                 trace.write("app", "review.failed", run_id=run.id, run_kind=run.kind, error=str(exc))
             if not self.store.mark_failed(run.id, run.project_id, run.mr_iid, run.source_sha, str(exc)):
                 return
-            try:
-                note = self._upsert_failure_note(run.project_id, run.mr_iid, run.source_sha, str(exc))
-                self.store.update_summary_note_id(run.project_id, run.mr_iid, note.id)
-            except Exception:  # noqa: BLE001
-                LOGGER.exception("Failed to publish failure note for run %s", run.id)
+            pass
 
     def _process_discussion_reconcile_run(self, run: ReviewRun) -> None:
         """Handle a follow-up review triggered by a human reply in a thread.
@@ -496,17 +488,7 @@ class ReviewService:
             self.store.upsert_tracked_finding(resolved)
             resolved_count += 1
 
-        dismissed_count = sum(1 for item in tracked_findings if item.status == "dismissed_by_discussion")
-        metrics = ReviewSummaryMetrics(
-            open_count=len(current_states),
-            new_count=sum(1 for item in current_states if item.status == "new"),
-            still_present_count=sum(1 for item in current_states if item.status == "still_present"),
-            resolved_count=resolved_count,
-            dismissed_count=dismissed_count,
-            unplaced_count=0,
-        )
         return _PublishedReviewState(
-            metrics=metrics,
             current_states=tuple(current_states),
         )
 
@@ -568,57 +550,10 @@ class ReviewService:
             )
             return None
 
-    def _delete_bot_note_if_present(self, project_id: int, mr_iid: int) -> None:
-        """Delete the bot's summary/failure note from the MR, if one exists."""
-        state = self.store.get_merge_request_state(project_id, mr_iid)
-        marker = note_marker(project_id, mr_iid)
-        existing = self.gitlab.find_bot_note(project_id, mr_iid, marker, state.summary_note_id if state else None)
-        if existing:
-            try:
-                self.gitlab.delete_note(project_id, mr_iid, existing.id)
-                self.store.update_summary_note_id(project_id, mr_iid, None)
-            except Exception:  # noqa: BLE001
-                LOGGER.warning("Failed to delete bot note note_id=%s project=%s mr=%s", existing.id, project_id, mr_iid)
-
     def _create_trace(self, run: ReviewRun) -> RunTrace | None:
         path = self.trace_settings.directory / f"run-{run.id}.jsonl"
         LOGGER.info("Trace enabled for run_id=%s path=%s", run.id, path)
         return RunTrace(path)
-
-    def _upsert_success_note(
-        self,
-        project_id: int,
-        mr_iid: int,
-        source_sha: str | None,
-        result: ReviewResult,
-        metrics: ReviewSummaryMetrics,
-        comparison: ReviewComparison | None,
-        unplaced_findings: tuple[ReviewFinding, ...],
-    ):
-        state = self.store.get_merge_request_state(project_id, mr_iid)
-        marker = note_marker(project_id, mr_iid)
-        existing = self.gitlab.find_bot_note(project_id, mr_iid, marker, state.summary_note_id if state else None)
-        body = render_success_note(
-            project_id,
-            mr_iid,
-            source_sha or "",
-            result,
-            metrics=metrics,
-            comparison=comparison,
-            unplaced_findings=unplaced_findings,
-        )
-        if existing:
-            return self.gitlab.update_note(project_id, mr_iid, existing.id, body)
-        return self.gitlab.create_note(project_id, mr_iid, body)
-
-    def _upsert_failure_note(self, project_id: int, mr_iid: int, source_sha: str | None, error: str):
-        state = self.store.get_merge_request_state(project_id, mr_iid)
-        marker = note_marker(project_id, mr_iid)
-        existing = self.gitlab.find_bot_note(project_id, mr_iid, marker, state.summary_note_id if state else None)
-        body = render_failure_note(project_id, mr_iid, source_sha or "", error, existing.body if existing else None)
-        if existing:
-            return self.gitlab.update_note(project_id, mr_iid, existing.id, body)
-        return self.gitlab.create_note(project_id, mr_iid, body)
 
     def _load_previous_success_result(
         self,
@@ -807,17 +742,17 @@ def _parse_discussion_reconcile_result(payload: dict) -> DiscussionReconcileResu
 
 def _format_provider_label(sources: tuple) -> tuple[str, bool]:
     """Return (label_markdown, both_found) for the given sources."""
-    names = {"codex": "Codex", "claude": "Claude"}
+    names = {"codex": "Codex ֎", "claude": "Claude ✴️"}
     labels = [names.get(s, s.capitalize()) for s in sources if s in names]
     both = len(labels) >= 2
     if both:
-        return "**Codex + Claude**", True
+        return "**Codex ֎ + Claude ✴️**", True
     return labels[0] if labels else "", False
 
 
 def _reply_with_marker(body: str, fingerprint: str, provider: str = "") -> str:
-    label = {"codex": "Codex", "claude": "Claude"}.get(provider, "")
-    prefix = f"**Nimble Reviewer** ({label})\n\n" if label else ""
+    label = {"codex": "Codex ֎", "claude": "Claude ✴️"}.get(provider, "")
+    prefix = f"{label}\n\n" if label else ""
     return f"{prefix}{body.strip()}\n\n{_finding_marker(fingerprint)}"
 
 
@@ -828,34 +763,31 @@ def _render_still_present_reply(source_sha: str, fingerprint: str) -> str:
     )
 
 
+_SEVERITY_LABEL = {"high": "🚨 High", "medium": "⚠️ Medium", "low": "💡 Low"}
+
+
 def _render_finding_thread_body(finding: ReviewFinding, fingerprint: str) -> str:
     provider_label, both_found = _format_provider_label(finding.sources)
     is_low_single = not both_found and finding.severity == "low"
 
-    header = f"**Nimble Reviewer** · `{finding.severity.upper()}`"
-    if provider_label:
-        header += f" · {provider_label}"
+    severity = _SEVERITY_LABEL.get(finding.severity, finding.severity.capitalize())
+    header = severity
     if is_low_single:
         header += " · *minor note*"
 
     title = f"_**{finding.title}**_" if is_low_single else f"**{finding.title}**"
 
-    lines = [header]
-    if both_found:
-        lines.extend(["", "> Both reviewers flagged this independently."])
-    lines.extend(["", title, "", finding.body])
+    lines = [header, "", title, "", finding.body]
     if finding.suggestion:
         lines.extend(["", f"Suggested fix: {finding.suggestion}"])
+    if provider_label:
+        lines.extend(["", f"By {provider_label}"])
     lines.extend(["", _finding_marker(fingerprint)])
     return "\n".join(lines).strip()
 
 
 def _render_thread_reply(finding: ReviewFinding) -> str:
-    lines = [
-        f"**Nimble Reviewer** found a related concern: **{finding.title}**",
-        "",
-        finding.body,
-    ]
+    lines = [f"**{finding.title}**", "", finding.body]
     if finding.suggestion:
         lines.extend(["", f"Suggested fix: {finding.suggestion}"])
     return "\n".join(lines).strip()
@@ -885,18 +817,6 @@ def _should_add_still_present_reply(
             continue
         return note.author_id != bot_user_id
     return True
-
-
-def _metrics_from_tracked_findings(tracked_findings: list[TrackedFinding]) -> ReviewSummaryMetrics:
-    open_findings = [item for item in tracked_findings if item.status == "open"]
-    return ReviewSummaryMetrics(
-        open_count=len(open_findings),
-        new_count=0,
-        still_present_count=0,
-        resolved_count=0,
-        dismissed_count=sum(1 for item in tracked_findings if item.status == "dismissed_by_discussion"),
-        unplaced_count=sum(1 for item in open_findings if item.thread_owner == "summary-only"),
-    )
 
 
 def _build_review_comparison(previous: ReviewResult | None, current: ReviewResult) -> ReviewComparison:

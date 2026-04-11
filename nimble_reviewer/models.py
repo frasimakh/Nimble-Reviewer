@@ -135,7 +135,6 @@ class ReviewRun:
 class MergeRequestState:
     project_id: int
     mr_iid: int
-    summary_note_id: int | None
     last_seen_sha: str | None
     last_reviewed_sha: str | None
     status: str
@@ -184,16 +183,6 @@ class TrackedFinding:
     dismissed_sha: str | None = None
     context_snippet: str | None = None
     updated_at: str | None = None
-
-
-@dataclass(frozen=True)
-class ReviewSummaryMetrics:
-    open_count: int
-    new_count: int
-    still_present_count: int
-    resolved_count: int
-    dismissed_count: int
-    unplaced_count: int
 
 
 @dataclass(frozen=True)

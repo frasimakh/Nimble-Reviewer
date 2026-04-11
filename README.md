@@ -69,6 +69,150 @@ This reconcile flow:
 
 Bot-owned threads may be auto-resolved when a human explanation convincingly dismisses the concern. Human-owned threads are reply-only; the bot never resolves them.
 
+## Data model
+
+The service stores three kinds of state in SQLite.
+
+**`merge_request_state`** — one row per MR:
+
+| column | description |
+|---|---|
+| `project_id`, `mr_iid` | primary key |
+| `summary_note_id` | GitLab note ID of the bot's summary comment |
+| `last_seen_sha` | latest commit the service has observed |
+| `last_reviewed_sha` | last commit where a full review completed successfully |
+
+**`review_run`** — the work queue:
+
+| column | description |
+|---|---|
+| `kind` | `full_review` or `discussion_reconcile` |
+| `source_sha`, `target_sha` | commits being reviewed |
+| `status` | queued → running → done / failed / superseded |
+| `trigger_discussion_id`, `trigger_note_id`, `trigger_author_id` | set on reconcile runs to identify what triggered them |
+
+**`tracked_finding`** — every finding across all reviews:
+
+| column | description |
+|---|---|
+| `fingerprint` | deterministic hash of (file, line, severity, title, body); the stable identity of a finding across reviews |
+| `status` | `open`, `resolved`, or `dismissed_by_discussion` |
+| `discussion_id`, `root_note_id` | links to the GitLab discussion thread, if one was created |
+| `thread_owner` | `bot`, `human`, or `summary-only` |
+| `opened_sha`, `last_seen_sha`, `resolved_sha`, `dismissed_sha` | commit at which each status transition happened |
+
+## Full review — detailed flow
+
+### 1. Webhook → queue
+
+A GitLab merge request event is parsed and turned into a `full_review` run when:
+
+- a non-draft MR is opened or reopened
+- the MR title changes from draft to ready
+- new commits are pushed to an already-open ready MR
+
+The extracted data is:
+
+```
+project_id, mr_iid       — which MR
+source_sha, target_sha   — current commits
+```
+
+Enqueue rules:
+- If a `full_review` for the same project/MR/SHA already exists in queued, running, or done state, the new request is dropped as a duplicate.
+- When a new `full_review` is enqueued, any previous queued or running run for the same MR is marked superseded.
+
+### 2. Repository checkout and diff
+
+`gitops.py` prepares the working directory:
+
+1. Maintains a bare clone mirror per repository. On first use it runs `git clone --mirror`; on subsequent runs it runs `git fetch --prune`.
+2. Creates a temporary checkout from the mirror and checks out `source_sha`.
+3. Computes the merge base between the MR head and the target branch.
+4. Builds two diffs:
+   - **full diff** — `git diff <merge_base>..<source_sha>` — the complete set of changes in the MR
+   - **incremental diff** — `git diff <previous_reviewed_sha>..<source_sha>` — only what changed since the last completed review; empty on the first review of an MR
+5. Loads `NIMBLE-REVIEWER.MD` from the repo root if present.
+
+### 3. Review prompt
+
+`prompts.py` assembles the prompt sent to the council:
+
+- MR metadata: title, source and target branches, SHA, URL, description
+- Repository rules from `NIMBLE-REVIEWER.MD` (capped to avoid crowding out the diff)
+- Open discussion digest: a summary of unresolved threads on changed files with all their notes, so the council knows what is already under discussion
+- List of changed files
+- Incremental diff, labelled "focus primarily on these changes", so the council avoids re-reporting concerns from unchanged code
+- Full unified diff (capped at 200 k characters)
+
+The council returns JSON:
+
+```json
+{
+  "summary": "short review summary",
+  "overall_risk": "high | medium | low",
+  "findings": [
+    {
+      "severity": "high | medium | low",
+      "file": "path/to/file.py",
+      "line": 123,
+      "title": "short title",
+      "body": "actionable explanation",
+      "suggestion": "optional fix direction"
+    }
+  ]
+}
+```
+
+### 4. Publishing findings
+
+For each finding in the council result:
+
+1. **Fingerprint lookup** — if a `tracked_finding` with the same fingerprint exists, its discussion thread is reused.
+2. **Fuzzy match** — if no exact fingerprint match, the service looks for an existing finding with matching file, line, and content.
+3. **New thread** — if no match exists, the service tries to post an inline diff discussion anchored to the exact code line. If that fails (position not in diff, invalid mapping), it falls back to a top-level MR discussion. If the MR head moved during publish, the finding falls back to summary-only and the run is superseded.
+
+Findings that appeared in the previous review and are still present get a "still present at `<sha>`" reply added to their thread. The reply includes a hidden marker so it is never duplicated across runs.
+
+Findings from the previous review that are no longer present are resolved: their `tracked_finding` status is set to `resolved` and the GitLab discussion is marked resolved.
+
+The single summary note for the MR is upserted after every full review. It shows the overall risk, finding counts (new, still present, resolved, dismissed), and a brief council summary.
+
+## Discussion reconcile — detailed flow
+
+### 1. Trigger
+
+When a human adds a note to a merge request discussion and GitLab `note_events` are enabled, the service enqueues a `discussion_reconcile` run. The note must be on a merge request (not a commit or snippet), and bot-authored notes are ignored.
+
+A reconcile run is not enqueued if a `full_review` is already queued or running for that MR — the full review will pick up the latest discussion state when it runs.
+
+### 2. Prompt
+
+`prompts.py` builds the reconcile prompt with:
+
+- MR metadata
+- The original finding: fingerprint, severity, file, line, title, body
+- A diff excerpt for the file and line mentioned in the finding
+- The full discussion thread: all notes in order
+- The latest human note that triggered the run
+
+### 3. Decision
+
+A single provider (configurable via `DISCUSSION_RECONCILE_PROVIDER`) returns one of four decisions:
+
+| decision | meaning | action |
+|---|---|---|
+| `dismissed_by_discussion` | human provided a concrete explanation or explicit acceptance | set finding to `dismissed_by_discussion`, post a reply, resolve the thread if bot-owned |
+| `reply_only` | finding stays open but a reply is useful | post a reply, keep finding open |
+| `keep_open` | human did not engage substantively | post a reply re-explaining the concern, keep finding open |
+| `no_action` | off-topic or noise | do nothing |
+
+Human-owned threads are always reply-only; the bot never resolves them regardless of the decision.
+
+### 4. Suppression on next full review
+
+A finding marked `dismissed_by_discussion` is not re-reported in subsequent full reviews unless the diff has new changes near the dismissed line. This prevents the bot from re-raising concerns that a human has already accepted.
+
 ## Required environment
 
 - `GITLAB_URL` should be the base URL of your self-hosted GitLab instance, for example `https://gitlab.example.com`

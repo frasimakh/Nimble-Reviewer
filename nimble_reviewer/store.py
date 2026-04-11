@@ -244,18 +244,6 @@ class Store:
             ).fetchone()
             return self._row_to_run(row) if row else None
 
-    def update_summary_note_id(self, project_id: int, mr_iid: int, note_id: int | None) -> None:
-        with closing(self._connect()) as conn:
-            conn.execute(
-                """
-                UPDATE merge_request_state
-                SET summary_note_id = ?, updated_at = ?
-                WHERE project_id = ? AND mr_iid = ?
-                """,
-                (note_id, utcnow(), project_id, mr_iid),
-            )
-            conn.commit()
-
     def list_tracked_findings(
         self,
         project_id: int,
@@ -516,8 +504,8 @@ class Store:
     ) -> None:
         conn.execute(
             """
-            INSERT INTO merge_request_state(project_id, mr_iid, summary_note_id, last_seen_sha, last_reviewed_sha, status, updated_at)
-            VALUES (?, ?, NULL, ?, ?, ?, ?)
+            INSERT INTO merge_request_state(project_id, mr_iid, last_seen_sha, last_reviewed_sha, status, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?)
             ON CONFLICT(project_id, mr_iid) DO UPDATE SET
                 last_seen_sha = excluded.last_seen_sha,
                 last_reviewed_sha = COALESCE(excluded.last_reviewed_sha, merge_request_state.last_reviewed_sha),
@@ -552,7 +540,6 @@ class Store:
         return MergeRequestState(
             project_id=row["project_id"],
             mr_iid=row["mr_iid"],
-            summary_note_id=row["summary_note_id"],
             last_seen_sha=row["last_seen_sha"],
             last_reviewed_sha=row["last_reviewed_sha"],
             status=row["status"],
