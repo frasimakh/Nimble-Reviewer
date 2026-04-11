@@ -6,7 +6,7 @@ from nimble_reviewer.models import MergeRequestInfo, ReviewResult
 
 
 MAX_DIFF_CHARS = 200_000
-MAX_DISCUSSION_CHARS = 12_000
+MAX_DISCUSSION_CHARS = 40_000
 
 
 def build_review_prompt(
@@ -14,6 +14,7 @@ def build_review_prompt(
     diff_text: str,
     changed_files: list[str],
     discussion_digest: str | None = None,
+    discussion_inventory: str | None = None,
     repo_rules_text: str | None = None,
     repo_rules_path: str | None = None,
     repo_rules_truncated: bool = False,
@@ -40,10 +41,17 @@ Repository-specific review rules from `{repo_rules_path or "repository rules fil
 {repo_rules_text}
 ```
 """
+    inventory_section = ""
+    if discussion_inventory:
+        inventory_section = f"""
+All MR discussions (full list — open and resolved):
+{discussion_inventory}
+"""
+
     discussion_section = ""
     if discussion_digest:
         discussion_section = f"""
-Open and recent merge request discussion context:
+Open and recent discussion details (excerpts from the above list):
 ```md
 {discussion_digest[:MAX_DISCUSSION_CHARS]}
 ```
@@ -106,6 +114,7 @@ Merge request metadata:
 Description:
 {mr.description or "(empty)"}
 {repo_rules_section}
+{inventory_section}
 {discussion_section}
 
 Changed files:

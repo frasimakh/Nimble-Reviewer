@@ -142,11 +142,13 @@ class ReviewService:
                 discussions = self.gitlab.list_merge_request_discussions(run.project_id, run.mr_iid)
                 tracked_findings = self.store.list_tracked_findings(run.project_id, run.mr_iid)
                 discussion_digest = _build_discussion_digest(discussions, checkout.changed_files, tracked_findings)
+                discussion_inventory = _build_discussion_inventory(discussions)
                 prompt = build_review_prompt(
                     mr_info,
                     checkout.diff_text,
                     checkout.changed_files,
                     discussion_digest=discussion_digest,
+                    discussion_inventory=discussion_inventory or None,
                     repo_rules_text=checkout.review_rules_text,
                     repo_rules_path=checkout.review_rules_path,
                     repo_rules_truncated=checkout.review_rules_truncated,
@@ -590,19 +592,28 @@ def _build_discussion_digest(
 ) -> str:
     linked_discussions = {item.discussion_id for item in tracked_findings if item.discussion_id}
     changed_file_set = set(changed_files)
+
+    def _priority(d: GitLabDiscussion) -> int:
+        # 0 = unresolved on changed file, 1 = unresolved elsewhere, 2 = resolved+tracked, 3 = skip
+        if d.individual_note:
+            return 3
+        file_path = d.position.new_path if d.position else None
+        if not d.resolved:
+            return 0 if file_path in changed_file_set else 1
+        if d.id in linked_discussions:
+            return 2
+        return 3
+
+    sorted_discussions = sorted(discussions, key=_priority)
     blocks: list[str] = []
     total_chars = 0
-    for discussion in discussions:
-        file_path = discussion.position.new_path if discussion.position else None
-        if not discussion.resolved and (file_path in changed_file_set or discussion.id in linked_discussions):
-            block = _render_discussion_context(discussion)
-            blocks.append(block)
-            total_chars += len(block)
-        elif discussion.id in linked_discussions:
-            block = _render_discussion_context(discussion)
-            blocks.append(block)
-            total_chars += len(block)
-        if total_chars > 10_000:
+    for discussion in sorted_discussions:
+        if _priority(discussion) == 3:
+            break
+        block = _render_discussion_context(discussion)
+        blocks.append(block)
+        total_chars += len(block)
+        if total_chars > 35_000:
             break
     return "\n\n".join(blocks)
 
@@ -616,6 +627,22 @@ def _render_discussion_context(discussion: GitLabDiscussion) -> str:
     for note in discussion.notes:
         author = f"user:{note.author_id}" if note.author_id is not None else "user:unknown"
         lines.append(f"- {author}: {note.body.strip()}")
+    return "\n".join(lines)
+
+
+def _build_discussion_inventory(discussions: list[GitLabDiscussion]) -> str:
+    """One-liner per discussion so the model knows every thread exists, even if not in the digest."""
+    lines: list[str] = []
+    for d in discussions:
+        if d.individual_note:
+            continue
+        location = ""
+        if d.position:
+            line = d.position.new_line or d.position.old_line or "?"
+            location = f" @ {d.position.new_path}:{line}"
+        status = "resolved" if d.resolved else "open"
+        n = len(d.notes)
+        lines.append(f"- {d.id}{location} [{status}, {n} note{'s' if n != 1 else ''}]")
     return "\n".join(lines)
 
 
