@@ -108,8 +108,9 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
         event = parse_review_request_event(payload, bot_user_id=bot_user_id)
         if not event:
+            changes = payload.get("changes") or {}
             LOGGER.info(
-                "Ignored webhook project=%s mr=%s object_kind=%s action=%s state=%s draft=%s sha=%s",
+                "Ignored webhook project=%s mr=%s object_kind=%s action=%s state=%s draft=%s sha=%s changes_keys=%s",
                 project_id,
                 mr_iid,
                 object_kind,
@@ -122,6 +123,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                     or attributes.get("sha")
                     or (payload.get("merge_request") or {}).get("sha")
                 ),
+                sorted(changes.keys()),
             )
             response.status_code = 202
             return {"status": "ignored"}
