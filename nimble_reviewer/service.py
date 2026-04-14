@@ -212,6 +212,19 @@ class ReviewService:
                 LOGGER.info("Run %s became stale during inline publish", run.id)
                 return
 
+            if not result.findings:
+                LOGGER.info(
+                    "No findings for run_id=%s project=%s mr=%s — posting clean-review note",
+                    run.id,
+                    run.project_id,
+                    run.mr_iid,
+                )
+                self.gitlab.create_note(
+                    run.project_id,
+                    run.mr_iid,
+                    _render_no_findings_note(result),
+                )
+
             self.store.mark_done(run.id, run.project_id, run.mr_iid, mr_info.source_sha)
             LOGGER.info(
                 "Completed full review run_id=%s total_sec=%.2f",
@@ -613,6 +626,10 @@ def _short_sha(value: str | None) -> str:
     if not value:
         return "-"
     return value[:12]
+
+
+def _render_no_findings_note(result: ReviewResult) -> str:
+    return result.summary.strip() if result.summary and result.summary.strip() else "Looks good — no issues found."
 
 
 def _build_discussion_digest(

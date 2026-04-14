@@ -621,7 +621,8 @@ class ReviewServiceTests(unittest.TestCase):
         tracked = self.store.list_tracked_findings(1, 2)
         self.assertEqual(tracked[0].status, "resolved")
         self.assertEqual(gitlab.resolved_changes, [("d1", True)])
-        self.assertIsNone(gitlab.summary_note)
+        self.assertIsNotNone(gitlab.summary_note)
+        self.assertEqual(gitlab.summary_note.body, "Looks clear.")
 
     def test_discussion_reconcile_dismisses_bot_thread_and_resolves_it(self):
         workspace = Path(self.tmpdir.name)
