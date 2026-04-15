@@ -187,10 +187,7 @@ Use these rules when judging whether a human's dismissal is acceptable or whethe
 
     diff_section = ""
     if diff_text:
-        relevant_diff = _extract_file_diff(diff_text, finding_file) if finding_file else ""
-        if not relevant_diff:
-            relevant_diff = diff_text
-        relevant_diff = relevant_diff[:MAX_RECONCILE_FILE_DIFF_CHARS]
+        relevant_diff = diff_text[:MAX_RECONCILE_FILE_DIFF_CHARS]
         diff_section = f"""
 MR diff (use this to verify claims about what changed):
 ```diff
@@ -215,7 +212,7 @@ Rules:
 - Do not dismiss on vague or ambiguous reassurances. Distinguish between "this is not important to us" (explicit acceptance — use `dismissed_by_discussion`) and an incomplete or tangential reply (use `keep_open`).
 - When the diff is available, verify the human's claim against it before deciding. If the diff confirms the fix, use `dismissed_by_discussion`. If the diff contradicts the claim, use `keep_open`.
 - Write `reply_body` in plain, direct markdown. Be concise and natural — like a colleague in a code review, not a formal system message.
-- Write `reply_body` in the same language as the human's latest note.
+- If repository rules specify a language for output, write `reply_body` in that language. Otherwise, write `reply_body` in the same language as the human's latest note.
 - Keep `reason` short and specific.
 - Never ask for more information. Decide from the discussion context.
 
