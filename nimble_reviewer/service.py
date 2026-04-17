@@ -316,6 +316,7 @@ class ReviewService:
                     linked_finding_payload=_tracked_finding_payload(tracked),
                     diff_text=checkout.diff_text,
                     finding_file=tracked.file,
+                    changed_files=checkout.changed_files,
                     repo_rules_text=checkout.review_rules_text,
                     repo_rules_path=checkout.review_rules_path,
                 )

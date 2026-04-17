@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from pathlib import PurePosixPath
 import re
 
 from nimble_reviewer.models import MergeRequestInfo, ReviewResult
@@ -146,19 +147,119 @@ Unified diff (full, base → HEAD):
 
 
 MAX_RECONCILE_FILE_DIFF_CHARS = 20_000
+MAX_RECONCILE_DIFF_FILES = 4
+
+_DIFF_HEADER_RE = re.compile(r"^diff --git a/(.+?) b/(.+)$")
+_TEST_MENTION_RE = re.compile(r"\btests?\b|тест", re.IGNORECASE)
+
+
+def _split_diff_sections(diff_text: str) -> list[tuple[str, str]]:
+    sections: list[tuple[str, str]] = []
+    current_path: str | None = None
+    current_lines: list[str] = []
+
+    for line in diff_text.splitlines(keepends=True):
+        match = _DIFF_HEADER_RE.match(line.rstrip("\n"))
+        if match:
+            if current_path is not None:
+                sections.append((current_path, "".join(current_lines)))
+            current_path = match.group(2)
+            current_lines = [line]
+            continue
+        if current_path is not None:
+            current_lines.append(line)
+
+    if current_path is not None:
+        sections.append((current_path, "".join(current_lines)))
+    return sections
 
 
 def _extract_file_diff(diff_text: str, file_path: str) -> str:
     """Extract the diff section for a specific file from a unified diff."""
-    lines = diff_text.splitlines(keepends=True)
-    result: list[str] = []
-    in_file = False
-    for line in lines:
-        if line.startswith("diff --git"):
-            in_file = file_path in line
-        if in_file:
-            result.append(line)
-    return "".join(result)
+    for path, section in _split_diff_sections(diff_text):
+        if path == file_path:
+            return section
+    return ""
+
+
+def _looks_like_test_file(path: str) -> bool:
+    name = PurePosixPath(path).name.lower()
+    lowered = path.lower()
+    return "/test" in lowered or "/tests/" in lowered or name.startswith("test_") or name.endswith("_test.py")
+
+
+def _mentioned_changed_files(*, changed_files: list[str], texts: list[str]) -> list[str]:
+    haystack = "\n".join(text for text in texts if text)
+    if not haystack:
+        return []
+
+    matches: list[str] = []
+    for path in changed_files:
+        basename = PurePosixPath(path).name
+        if path in haystack or basename in haystack:
+            matches.append(path)
+    return matches
+
+
+def _related_test_files(finding_file: str, changed_files: list[str]) -> list[str]:
+    target_stem = PurePosixPath(finding_file).stem.removeprefix("test_").lower()
+    if not target_stem:
+        return []
+
+    matches: list[str] = []
+    for path in changed_files:
+        if not _looks_like_test_file(path):
+            continue
+        candidate_stem = PurePosixPath(path).stem.removeprefix("test_").lower()
+        if candidate_stem == target_stem or target_stem in candidate_stem or candidate_stem in target_stem:
+            matches.append(path)
+    return matches
+
+
+def _build_reconcile_diff_excerpt(
+    *,
+    diff_text: str,
+    finding_file: str | None,
+    changed_files: list[str] | None,
+    discussion_text: str,
+    trigger_note_body: str,
+) -> str:
+    candidate_paths: list[str] = []
+    available_changed_files = changed_files or [path for path, _ in _split_diff_sections(diff_text)]
+
+    if finding_file:
+        candidate_paths.append(finding_file)
+
+    candidate_paths.extend(
+        _mentioned_changed_files(
+            changed_files=available_changed_files,
+            texts=[discussion_text, trigger_note_body],
+        )
+    )
+
+    if finding_file and _TEST_MENTION_RE.search(f"{discussion_text}\n{trigger_note_body}"):
+        candidate_paths.extend(_related_test_files(finding_file, available_changed_files))
+
+    unique_paths: list[str] = []
+    for path in candidate_paths:
+        if path not in unique_paths:
+            unique_paths.append(path)
+
+    sections: list[str] = []
+    total_chars = 0
+    for path in unique_paths[:MAX_RECONCILE_DIFF_FILES]:
+        section = _extract_file_diff(diff_text, path)
+        if not section:
+            continue
+        remaining = MAX_RECONCILE_FILE_DIFF_CHARS - total_chars
+        if remaining <= 0:
+            break
+        sections.append(section[:remaining])
+        total_chars += len(sections[-1])
+
+    if sections:
+        return "".join(sections)
+    return diff_text[:MAX_RECONCILE_FILE_DIFF_CHARS]
 
 
 def build_discussion_reconcile_prompt(
@@ -170,6 +271,7 @@ def build_discussion_reconcile_prompt(
     linked_finding_payload: dict | None,
     diff_text: str | None = None,
     finding_file: str | None = None,
+    changed_files: list[str] | None = None,
     repo_rules_text: str | None = None,
     repo_rules_path: str | None = None,
 ) -> str:
@@ -187,12 +289,13 @@ Use these rules when judging whether a human's dismissal is acceptable or whethe
 
     diff_section = ""
     if diff_text:
-        relevant_diff = ""
-        if finding_file:
-            relevant_diff = _extract_file_diff(diff_text, finding_file)
-        if not relevant_diff:
-            relevant_diff = diff_text
-        relevant_diff = relevant_diff[:MAX_RECONCILE_FILE_DIFF_CHARS]
+        relevant_diff = _build_reconcile_diff_excerpt(
+            diff_text=diff_text,
+            finding_file=finding_file,
+            changed_files=changed_files,
+            discussion_text=discussion_text,
+            trigger_note_body=trigger_note_body,
+        )
         diff_section = f"""
 MR diff (use this to verify claims about what changed):
 ```diff
