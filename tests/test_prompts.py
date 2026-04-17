@@ -136,6 +136,84 @@ class DiscussionReconcilePromptTests(unittest.TestCase):
         self.assertIn("diff --git a/tests/test_alembic_cli.py b/tests/test_alembic_cli.py", prompt)
         self.assertIn("test_prepare_argv", prompt)
 
+    def test_adds_evidence_summary_for_finding_identifiers_seen_in_test_diff(self) -> None:
+        source_block = (
+            "diff --git a/bin/alembic b/bin/alembic\n"
+            "--- a/bin/alembic\n"
+            "+++ b/bin/alembic\n"
+            "@@ -1 +1 @@\n"
+            '-exec "../runtime/bin/python"\n'
+            '+exec "$(dirname "$0")/python"\n'
+        )
+        test_block = (
+            "diff --git a/src/nimble_core/nimble_core/backend/persistence/tests/test_alembic_cli.py b/src/nimble_core/nimble_core/backend/persistence/tests/test_alembic_cli.py\n"
+            "--- a/src/nimble_core/nimble_core/backend/persistence/tests/test_alembic_cli.py\n"
+            "+++ b/src/nimble_core/nimble_core/backend/persistence/tests/test_alembic_cli.py\n"
+            "@@ -1,0 +1,6 @@\n"
+            "+def test_it_detects_revision_command_without_explicit_rev_id():\n"
+            "+    assert alembic_cli._should_autoset_revision_id([\"revision\"]) is True\n"
+            "+\n"
+            "+def test_it_appends_next_numeric_revision_id():\n"
+            "+    assert alembic_cli._prepare_argv([\"revision\"]) == []\n"
+        )
+        prompt = build_discussion_reconcile_prompt(
+            self.mr,
+            discussion_id="discussion-1",
+            discussion_text="Human: fixed\nHuman: ще дивись",
+            trigger_note_body="Ще дивись",
+            linked_finding_payload={
+                "file": "bin/alembic",
+                "line": 1,
+                "body": "Додати юніт-тести хоча б для `_should_autoset_revision_id` і `_prepare_argv`.",
+            },
+            diff_text=source_block + test_block,
+            finding_file="bin/alembic",
+            changed_files=[
+                "bin/alembic",
+                "src/nimble_core/nimble_core/backend/persistence/tests/test_alembic_cli.py",
+            ],
+        )
+
+        self.assertIn("Finding-related identifiers visible in the diff excerpt:", prompt)
+        self.assertIn("`src/nimble_core/nimble_core/backend/persistence/tests/test_alembic_cli.py`", prompt)
+        self.assertIn("`_should_autoset_revision_id`", prompt)
+        self.assertIn("`_prepare_argv`", prompt)
+
+    def test_includes_non_test_changed_file_when_diff_contains_finding_identifiers(self) -> None:
+        source_block = (
+            "diff --git a/src/alembic_cli.py b/src/alembic_cli.py\n"
+            "--- a/src/alembic_cli.py\n"
+            "+++ b/src/alembic_cli.py\n"
+            "@@ -1 +1 @@\n"
+            "+def _prepare_argv(argv): ...\n"
+        )
+        helper_block = (
+            "diff --git a/src/alembic_wrapper_support.py b/src/alembic_wrapper_support.py\n"
+            "--- a/src/alembic_wrapper_support.py\n"
+            "+++ b/src/alembic_wrapper_support.py\n"
+            "@@ -1 +1 @@\n"
+            "+PREPARE_ARGV_HELP = \"_prepare_argv and _should_autoset_revision_id are covered here\"\n"
+        )
+        prompt = build_discussion_reconcile_prompt(
+            self.mr,
+            discussion_id="discussion-1",
+            discussion_text="Human: fixed\nHuman: ще дивись",
+            trigger_note_body="Ще дивись",
+            linked_finding_payload={
+                "file": "src/alembic_cli.py",
+                "line": 1,
+                "body": "Потрібне покриття для `_should_autoset_revision_id` і `_prepare_argv`.",
+            },
+            diff_text=source_block + helper_block,
+            finding_file="src/alembic_cli.py",
+            changed_files=["src/alembic_cli.py", "src/alembic_wrapper_support.py"],
+        )
+
+        self.assertIn("Changed files in the current MR:", prompt)
+        self.assertIn("- src/alembic_wrapper_support.py", prompt)
+        self.assertIn("diff --git a/src/alembic_wrapper_support.py b/src/alembic_wrapper_support.py", prompt)
+        self.assertIn("`_prepare_argv`", prompt)
+
 
 if __name__ == "__main__":
     unittest.main()

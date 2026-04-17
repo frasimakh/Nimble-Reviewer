@@ -148,9 +148,11 @@ Unified diff (full, base → HEAD):
 
 MAX_RECONCILE_FILE_DIFF_CHARS = 20_000
 MAX_RECONCILE_DIFF_FILES = 4
+MAX_RECONCILE_CHANGED_FILES = 200
 
 _DIFF_HEADER_RE = re.compile(r"^diff --git a/(.+?) b/(.+)$")
 _TEST_MENTION_RE = re.compile(r"\btests?\b|тест", re.IGNORECASE)
+_BACKTICK_IDENTIFIER_RE = re.compile(r"`([A-Za-z_][A-Za-z0-9_]*)`")
 
 
 def _split_diff_sections(diff_text: str) -> list[tuple[str, str]]:
@@ -216,6 +218,41 @@ def _related_test_files(finding_file: str, changed_files: list[str]) -> list[str
     return matches
 
 
+def _finding_identifiers(linked_finding_payload: dict | None) -> list[str]:
+    if not linked_finding_payload:
+        return []
+
+    texts = [
+        str(linked_finding_payload.get("title", "")),
+        str(linked_finding_payload.get("body", "")),
+        str(linked_finding_payload.get("suggestion", "")),
+    ]
+    identifiers: list[str] = []
+    for text in texts:
+        for identifier in _BACKTICK_IDENTIFIER_RE.findall(text):
+            if identifier not in identifiers:
+                identifiers.append(identifier)
+    return identifiers
+
+
+def _files_with_identifier_hits(
+    diff_text: str,
+    changed_files: list[str],
+    linked_finding_payload: dict | None,
+) -> list[str]:
+    identifiers = _finding_identifiers(linked_finding_payload)
+    if not identifiers:
+        return []
+
+    sections = dict(_split_diff_sections(diff_text))
+    matches: list[str] = []
+    for path in changed_files:
+        section = sections.get(path, "")
+        if section and any(identifier in section for identifier in identifiers):
+            matches.append(path)
+    return matches
+
+
 def _build_reconcile_diff_excerpt(
     *,
     diff_text: str,
@@ -223,6 +260,7 @@ def _build_reconcile_diff_excerpt(
     changed_files: list[str] | None,
     discussion_text: str,
     trigger_note_body: str,
+    linked_finding_payload: dict | None,
 ) -> str:
     candidate_paths: list[str] = []
     available_changed_files = changed_files or [path for path, _ in _split_diff_sections(diff_text)]
@@ -239,6 +277,8 @@ def _build_reconcile_diff_excerpt(
 
     if finding_file:
         candidate_paths.extend(_related_test_files(finding_file, available_changed_files))
+
+    candidate_paths.extend(_files_with_identifier_hits(diff_text, available_changed_files, linked_finding_payload))
 
     unique_paths: list[str] = []
     for path in candidate_paths:
@@ -260,6 +300,38 @@ def _build_reconcile_diff_excerpt(
     if sections:
         return "".join(sections)
     return diff_text[:MAX_RECONCILE_FILE_DIFF_CHARS]
+
+
+def _reconcile_diff_evidence_summary(relevant_diff: str, linked_finding_payload: dict | None) -> str:
+    identifiers = _finding_identifiers(linked_finding_payload)
+    if not identifiers:
+        return ""
+
+    evidence_lines: list[str] = []
+    for path, section in _split_diff_sections(relevant_diff):
+        hits = [identifier for identifier in identifiers if identifier in section]
+        if not hits:
+            continue
+        evidence_lines.append(f"- `{path}`: {', '.join(f'`{hit}`' for hit in hits)}")
+
+    if not evidence_lines:
+        return ""
+
+    return "Finding-related identifiers visible in the diff excerpt:\n" + "\n".join(evidence_lines)
+
+
+def _render_changed_files_for_reconcile(changed_files: list[str] | None) -> str:
+    if not changed_files:
+        return ""
+    visible = changed_files[:MAX_RECONCILE_CHANGED_FILES]
+    lines = "\n".join(f"- {path}" for path in visible)
+    truncated_note = ""
+    if len(changed_files) > len(visible):
+        truncated_note = f"\n- ... and {len(changed_files) - len(visible)} more files"
+    return f"""
+Changed files in the current MR:
+{lines}{truncated_note}
+"""
 
 
 def build_discussion_reconcile_prompt(
@@ -287,6 +359,8 @@ Repository-specific review rules from `{repo_rules_path or "repository rules fil
 Use these rules when judging whether a human's dismissal is acceptable or whether the concern should stay open.
 """
 
+    changed_files_section = _render_changed_files_for_reconcile(changed_files)
+
     diff_section = ""
     if diff_text:
         relevant_diff = _build_reconcile_diff_excerpt(
@@ -295,8 +369,12 @@ Use these rules when judging whether a human's dismissal is acceptable or whethe
             changed_files=changed_files,
             discussion_text=discussion_text,
             trigger_note_body=trigger_note_body,
+            linked_finding_payload=linked_finding_payload,
         )
+        evidence_summary = _reconcile_diff_evidence_summary(relevant_diff, linked_finding_payload)
         diff_section = f"""
+{evidence_summary}
+
 MR diff (use this to verify claims about what changed):
 ```diff
 {relevant_diff}
@@ -319,6 +397,7 @@ Rules:
 - `no_action`: the note is clearly irrelevant, off-topic, or bot-authored noise — skip entirely, no `reply_body`.
 - Do not dismiss on vague or ambiguous reassurances. Distinguish between "this is not important to us" (explicit acceptance — use `dismissed_by_discussion`) and an incomplete or tangential reply (use `keep_open`).
 - When the diff is available, verify the human's claim against it before deciding. If the diff confirms the fix, use `dismissed_by_discussion`. If the diff contradicts the claim, use `keep_open`.
+- Treat changed files beyond the original finding file as relevant evidence when their visible diff covers functions, identifiers, config keys, or data names mentioned in the finding. Do not claim something is "missing in the diff" if the visible diff excerpt already includes that coverage in another changed file.
 - Write `reply_body` in plain, direct markdown. Be concise and natural — like a colleague in a code review, not a formal system message.
 - If repository rules specify a language for output, write `reply_body` in that language. Otherwise, write `reply_body` in the same language as the human's latest note.
 - Keep `reason` short and specific.
@@ -331,6 +410,7 @@ Merge request:
 - Source SHA: {mr.source_sha}
 - Web URL: {mr.web_url}
 {repo_rules_section}
+{changed_files_section}
 Tracked finding:
 ```json
 {finding_json}
