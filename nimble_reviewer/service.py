@@ -136,7 +136,7 @@ class ReviewService:
                 return
 
             previous_full_review = self.store.get_latest_done_run(run.project_id, run.mr_iid, kind="full_review")
-            previous_reviewed_sha = previous_full_review.source_sha if previous_full_review else None
+            previous_reviewed_sha = _incremental_review_base_sha(previous_full_review, run)
 
             checkout = self.repo_manager.prepare_checkout(
                 mr_info.repo_http_url,
@@ -626,6 +626,24 @@ def _short_sha(value: str | None) -> str:
     if not value:
         return "-"
     return value[:12]
+
+
+def _incremental_review_base_sha(previous_full_review: ReviewRun | None, run: ReviewRun) -> str | None:
+    if previous_full_review is None:
+        return None
+    if (
+        previous_full_review.target_sha
+        and run.target_sha
+        and previous_full_review.target_sha != run.target_sha
+    ):
+        LOGGER.info(
+            "Skipping incremental diff for run %s because target SHA changed since previous full review (%s -> %s)",
+            run.id,
+            _short_sha(previous_full_review.target_sha),
+            _short_sha(run.target_sha),
+        )
+        return None
+    return previous_full_review.source_sha
 
 
 def _render_no_findings_note(result: ReviewResult) -> str:

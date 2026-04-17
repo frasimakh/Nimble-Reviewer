@@ -485,6 +485,42 @@ class ReviewServiceTests(unittest.TestCase):
         self.assertEqual(repo_manager.prepare_previous_reviewed_shas, [None, None, "sha1"])
         self.assertIn("Changes since the previous full review (since sha1):", review_agent.last_prompt)
 
+    def test_incremental_diff_is_skipped_when_target_sha_changes(self):
+        workspace = Path(self.tmpdir.name)
+        (workspace / "file.py").write_text("new line\nsecond line\n", encoding="utf-8")
+        gitlab = FakeGitLabClient()
+        repo_manager = FakeRepoManager(workspace, incremental_diff_text="@@ -1 +1 @@\n+delta\n")
+        review_agent = FakeReviewAgentRunner(
+            result=ReviewResult(
+                summary="One issue found.",
+                overall_risk="medium",
+                findings=(ReviewFinding("medium", "file.py", 1, "Bug", "Needs fixing"),),
+            )
+        )
+        service = self._service(gitlab, repo_manager, review_agent)
+
+        self.store.enqueue_run(1, 2, "sha1", "target1")
+        first_run = self.store.claim_next_run()
+        service.process_run(first_run)
+
+        gitlab.mr_info = MergeRequestInfo(
+            project_id=1,
+            mr_iid=2,
+            title="Title",
+            description="Description",
+            source_branch="feature",
+            target_branch="main",
+            source_sha="sha2",
+            web_url=gitlab.mr_info.web_url,
+            repo_http_url=gitlab.mr_info.repo_http_url,
+        )
+        self.store.enqueue_run(1, 2, "sha2", "target2")
+        second_run = self.store.claim_next_run()
+        service.process_run(second_run)
+
+        self.assertEqual(repo_manager.prepare_previous_reviewed_shas, [None, None])
+        self.assertNotIn("Changes since the previous full review", review_agent.last_prompt)
+
     def test_still_present_reply_is_posted_once_per_silent_streak(self):
         workspace = Path(self.tmpdir.name)
         (workspace / "file.py").write_text("new line\nsecond line\n", encoding="utf-8")

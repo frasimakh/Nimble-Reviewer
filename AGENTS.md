@@ -62,9 +62,14 @@ Supporting modules: `models.py` (frozen dataclasses), `config.py` (env vars), `t
 - `finding_match.py` deduplication is fuzzy; tuning thresholds affects false positives and false matches.
 - Review traces are JSONL files in `REVIEW_TRACE_DIR`; finding detail lives in GitLab discussion threads.
 
-## Keeping README.md current
+## Keeping Docs And Rules Current
 
-After any change that affects architecture, data flow, trigger conditions, prompt structure, or public behaviour, update `README.md` to match. The README is the authoritative description of how the system works — it must reflect the actual code, not aspirational or removed functionality.
+After any change that affects architecture, data flow, trigger conditions, prompt structure, public behaviour, or agent guidance for this repository, update `README.md` and `AGENTS.md` to match. The code is the source of truth; documentation and agent rules must reflect the actual implementation, not aspirational or removed functionality.
+
+Treat the agent rules in `AGENTS.md` as living guidance:
+- add rules when the codebase gains new invariants or review expectations
+- change or expand rules when existing guidance becomes incomplete
+- remove or relax rules that no longer match the code or team practice
 
 Things to keep in sync:
 - intro bullet list (what the bot publishes)
@@ -73,6 +78,7 @@ Things to keep in sync:
 - "Publishing findings" flow
 - data model tables — columns and their meaning
 - any env vars added or removed
+- agent rules in `AGENTS.md`
 
 ## Running tests
 

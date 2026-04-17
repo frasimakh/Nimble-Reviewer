@@ -21,6 +21,7 @@ Typical uses:
 - tell the reviewer which folders deserve extra scrutiny
 - describe architectural invariants that must not be broken
 - list categories that should usually be ignored
+- keep repository-specific review policy current as the codebase evolves
 
 Example `NIMBLE-REVIEWER.MD`:
 
@@ -129,7 +130,7 @@ Enqueue rules:
 3. Computes the merge base between the MR head and the target branch.
 4. Builds two diffs:
    - **full diff** — `git diff <merge_base>..<source_sha>` — the complete set of changes in the MR
-   - **incremental diff** — `git diff <previous_reviewed_sha>..<source_sha>` — only what changed since the last completed review; empty on the first review of an MR
+   - **incremental diff** — `git diff <previous_reviewed_sha>..<source_sha>` — only what changed since the last completed review; empty on the first review of an MR, and skipped when the target branch SHA changed since the previous full review so rebases do not inject `develop` noise into the review focus
 5. Loads `NIMBLE-REVIEWER.MD` from the repo root if present.
 
 ### 3. Review prompt
@@ -140,7 +141,7 @@ Enqueue rules:
 - Repository rules from `NIMBLE-REVIEWER.MD` (capped to avoid crowding out the diff)
 - Open discussion digest: a summary of unresolved threads on changed files with all their notes, so the council knows what is already under discussion
 - List of changed files
-- Incremental diff, labelled "focus primarily on these changes", so the council avoids re-reporting concerns from unchanged code
+- Incremental diff, labelled "focus primarily on these changes", so the council avoids re-reporting concerns from unchanged code; omitted when the MR was rebased onto a newer target branch SHA because that diff would mostly show base-branch churn instead of author changes
 - Surrounding file context: lines around each changed hunk read from the checkout, so the council sees the full function/class context beyond the diff
 - Full unified diff (capped at 200 k characters)
 
