@@ -34,7 +34,7 @@ class Settings:
             gitlab_webhook_secret=_read_required("GITLAB_WEBHOOK_SECRET"),
             codex_cmd=_read_command(
                 "CODEX_CMD",
-                default='codex exec -m gpt-5.4 -c model_reasoning_effort="high" -',
+                default='codex exec --dangerously-bypass-approvals-and-sandbox -m gpt-5.4 -c model_reasoning_effort="high" -',
             ),
             claude_cmd=_read_command(
                 "CLAUDE_CMD",
@@ -75,4 +75,3 @@ def _read_command(env_name: str, default: str | None = None) -> tuple[str, ...]:
     if not value:
         raise RuntimeError(f"Missing required environment variable: {env_name}")
     return tuple(shlex.split(value))
-

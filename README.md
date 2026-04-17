@@ -239,13 +239,15 @@ Optional:
 Default command behavior:
 
 ```env
-CODEX_CMD=codex exec -m gpt-5.4 -c model_reasoning_effort="high" -
+CODEX_CMD=codex exec --dangerously-bypass-approvals-and-sandbox -m gpt-5.4 -c model_reasoning_effort="high" -
 CLAUDE_CMD=claude -p --output-format stream-json --model sonnet --effort high --permission-mode bypassPermissions
 COUNCIL_SYNTHESIS_PROVIDER=codex
 DISCUSSION_RECONCILE_PROVIDER=codex
 ```
 
 For Codex, the command should read the prompt from `stdin` and print the final review JSON to `stdout`.
+
+The default Docker-oriented `CODEX_CMD` deliberately disables Codex's own Linux sandbox and approvals inside the container. OpenAI's Codex docs note that Linux sandboxing in Docker may fail when the host or container does not provide the required `Landlock`/`seccomp`/user-namespace features, and recommend running `codex` with `--sandbox danger-full-access` inside a containerized isolation boundary in that case.
 
 For Claude Code, the service supports:
 
@@ -314,6 +316,7 @@ docker compose up --build
 ```
 
 The default compose file persists SQLite data in `reviewer-data` and repository mirrors in `reviewer-cache`.
+It also uses the default `CODEX_CMD` above, so Codex relies on Docker isolation instead of `bwrap` inside the container unless you override the command explicitly.
 
 If port `8080` is already occupied on the host, leave `PORT=8080` and change only `HOST_PORT`, for example:
 
@@ -410,3 +413,39 @@ docker compose exec -it nimble-reviewer claude
 ```
 
 Then run `/login` inside the Claude session and complete the browser-based sign-in flow.
+
+## Codex sandbox in Docker
+
+This image installs distro `bubblewrap`, but the default service command still runs Codex with:
+
+```env
+CODEX_CMD=codex exec --dangerously-bypass-approvals-and-sandbox -m gpt-5.4 -c model_reasoning_effort="high" -
+```
+
+That is intentional for container deployments: the service is already isolated by Docker, while Codex's Linux sandbox frequently fails inside containers with errors like `bwrap: No permissions to create a new namespace`.
+
+If you want to verify whether the host VM can support the internal Codex sandbox anyway, check these on the Docker host:
+
+```bash
+sysctl kernel.unprivileged_userns_clone
+sysctl kernel.apparmor_restrict_unprivileged_userns 2>/dev/null || true
+```
+
+Then check the running container:
+
+```bash
+docker exec nimble-reviewer which bwrap
+docker exec nimble-reviewer codex sandbox linux -- sh -lc 'echo sandbox-ok'
+```
+
+If `codex sandbox linux` still fails, keep the default `CODEX_CMD` above. If you explicitly want the internal Codex sandbox and your VM supports it, override `CODEX_CMD` in `.env`, for example:
+
+```env
+CODEX_CMD=codex exec -s workspace-write -m gpt-5.4 -c model_reasoning_effort="high" -
+```
+
+When `kernel.apparmor_restrict_unprivileged_userns` exists and is `1`, OpenAI's Codex docs recommend relaxing it before retrying:
+
+```bash
+sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+```
