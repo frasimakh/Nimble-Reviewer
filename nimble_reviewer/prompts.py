@@ -187,7 +187,12 @@ Use these rules when judging whether a human's dismissal is acceptable or whethe
 
     diff_section = ""
     if diff_text:
-        relevant_diff = diff_text[:MAX_RECONCILE_FILE_DIFF_CHARS]
+        relevant_diff = ""
+        if finding_file:
+            relevant_diff = _extract_file_diff(diff_text, finding_file)
+        if not relevant_diff:
+            relevant_diff = diff_text
+        relevant_diff = relevant_diff[:MAX_RECONCILE_FILE_DIFF_CHARS]
         diff_section = f"""
 MR diff (use this to verify claims about what changed):
 ```diff
