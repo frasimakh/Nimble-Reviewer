@@ -105,6 +105,37 @@ class DiscussionReconcilePromptTests(unittest.TestCase):
         self.assertIn("diff --git a/tests/test_alembic_cli.py b/tests/test_alembic_cli.py", prompt)
         self.assertIn("test_prepare_argv", prompt)
 
+    def test_includes_related_test_diff_even_when_latest_note_does_not_mention_tests(self) -> None:
+        source_block = (
+            "diff --git a/src/alembic_cli.py b/src/alembic_cli.py\n"
+            "--- a/src/alembic_cli.py\n"
+            "+++ b/src/alembic_cli.py\n"
+            "@@ -1 +1 @@\n"
+            '-exec "../runtime/bin/python"\n'
+            '+exec "$(dirname "$0")/python"\n'
+        )
+        test_block = (
+            "diff --git a/tests/test_alembic_cli.py b/tests/test_alembic_cli.py\n"
+            "--- a/tests/test_alembic_cli.py\n"
+            "+++ b/tests/test_alembic_cli.py\n"
+            "@@ -1,0 +1,4 @@\n"
+            "+def test_prepare_argv():\n"
+            "+    assert True\n"
+        )
+        prompt = build_discussion_reconcile_prompt(
+            self.mr,
+            discussion_id="discussion-1",
+            discussion_text="Human: fixed\nHuman: ще дивись",
+            trigger_note_body="Ще дивись",
+            linked_finding_payload={"file": "src/alembic_cli.py", "line": 1},
+            diff_text=source_block + test_block,
+            finding_file="src/alembic_cli.py",
+            changed_files=["src/alembic_cli.py", "tests/test_alembic_cli.py"],
+        )
+
+        self.assertIn("diff --git a/tests/test_alembic_cli.py b/tests/test_alembic_cli.py", prompt)
+        self.assertIn("test_prepare_argv", prompt)
+
 
 if __name__ == "__main__":
     unittest.main()

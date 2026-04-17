@@ -190,7 +190,7 @@ A reconcile run is not enqueued if a `full_review` is already queued or running 
 
 - MR metadata
 - The original finding: fingerprint, severity, file, line, title, body
-- A focused diff excerpt centered on the finding file, augmented with related test files or files explicitly mentioned in the human reply when available
+- A focused diff excerpt centered on the finding file, augmented with related test files and any changed files explicitly mentioned in the human reply when available
 - The full discussion thread: all notes in order
 - The latest human note that triggered the run
 

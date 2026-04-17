@@ -237,7 +237,7 @@ def _build_reconcile_diff_excerpt(
         )
     )
 
-    if finding_file and _TEST_MENTION_RE.search(f"{discussion_text}\n{trigger_note_body}"):
+    if finding_file:
         candidate_paths.extend(_related_test_files(finding_file, available_changed_files))
 
     unique_paths: list[str] = []
