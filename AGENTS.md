@@ -36,7 +36,7 @@ Supporting modules: `models.py` (frozen dataclasses), `config.py` (env vars), `t
    - `discussion_reconcile` for MR note events
 3. `store.py` enqueues the run in SQLite.
 4. Newer full-review runs supersede older queued/running runs on the same MR.
-5. Discussion reconcile runs collapse to the newest one unless a full review is already queued/running.
+5. Discussion reconcile runs collapse only within the same discussion thread; different discussion threads stay queued independently unless a full review is already queued/running.
 6. Full review:
    - `gitops.py` prepares checkout and diff
    - `prompts.py` builds a council review prompt with diff, file context, metadata, repo rules, and discussion digest
@@ -55,6 +55,7 @@ Supporting modules: `models.py` (frozen dataclasses), `config.py` (env vars), `t
 - Only one full-review SHA per MR is active at a time; newer full reviews supersede older queued/running ones.
 - Push events to an already-open ready MR do auto-trigger a full review.
 - Note events can trigger lightweight reconciliation when GitLab `note_events` are enabled.
+- Reconcile runs are de-duplicated per `discussion_id`; a new reply in one thread must not supersede pending reconcile work for a different thread on the same MR.
 - Human-owned threads are reply-only; the bot never resolves them.
 - Bot-owned threads may be resolved automatically when a human explanation dismisses the concern.
 - Findings that cannot be mapped to a valid diff position fall back to summary-only instead of failing the whole review.

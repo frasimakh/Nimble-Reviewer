@@ -49,7 +49,7 @@ class StoreTests(unittest.TestCase):
         self.assertFalse(decision.enqueued)
         self.assertEqual(decision.reason, "full_review_pending")
 
-    def test_new_discussion_reconcile_supersedes_older_reconcile(self):
+    def test_new_discussion_reconcile_supersedes_older_reconcile_for_same_discussion(self):
         first = self.store.enqueue_run(
             1,
             2,
@@ -68,7 +68,7 @@ class StoreTests(unittest.TestCase):
             "sha1",
             None,
             kind="discussion_reconcile",
-            trigger_discussion_id="d2",
+            trigger_discussion_id="d1",
             trigger_note_id=11,
             trigger_author_id=21,
         )
@@ -76,6 +76,60 @@ class StoreTests(unittest.TestCase):
         first_run = self.store.get_run(first.run_id)
         second_run = self.store.get_run(second.run_id)
         self.assertEqual(first_run.status, "superseded")
+        self.assertEqual(second_run.status, "queued")
+
+    def test_discussion_reconcile_for_different_discussions_do_not_supersede_each_other(self):
+        first = self.store.enqueue_run(
+            1,
+            2,
+            "sha1",
+            None,
+            kind="discussion_reconcile",
+            trigger_discussion_id="d1",
+            trigger_note_id=10,
+            trigger_author_id=20,
+        )
+        second = self.store.enqueue_run(
+            1,
+            2,
+            "sha1",
+            None,
+            kind="discussion_reconcile",
+            trigger_discussion_id="d2",
+            trigger_note_id=11,
+            trigger_author_id=21,
+        )
+
+        first_run = self.store.get_run(first.run_id)
+        second_run = self.store.get_run(second.run_id)
+        self.assertEqual(first_run.status, "queued")
+        self.assertEqual(second_run.status, "queued")
+
+    def test_discussion_reconcile_without_discussion_id_only_supersedes_same_note(self):
+        first = self.store.enqueue_run(
+            1,
+            2,
+            "sha1",
+            None,
+            kind="discussion_reconcile",
+            trigger_discussion_id=None,
+            trigger_note_id=10,
+            trigger_author_id=20,
+        )
+        second = self.store.enqueue_run(
+            1,
+            2,
+            "sha1",
+            None,
+            kind="discussion_reconcile",
+            trigger_discussion_id=None,
+            trigger_note_id=11,
+            trigger_author_id=21,
+        )
+
+        first_run = self.store.get_run(first.run_id)
+        second_run = self.store.get_run(second.run_id)
+        self.assertEqual(first_run.status, "queued")
         self.assertEqual(second_run.status, "queued")
 
 

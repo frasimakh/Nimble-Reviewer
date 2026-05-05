@@ -67,6 +67,12 @@ This reconcile flow:
 - runs a single-provider decision pass
 - may keep the finding open, reply only, or mark it `dismissed_by_discussion`
 
+Queueing rules for reconcile runs are scoped per discussion thread:
+
+- a queued or running `full_review` still blocks new reconcile runs for that MR
+- a newer reconcile run supersedes older queued or running reconcile runs for the same `discussion_id`
+- reconcile runs for different discussions stay queued independently and are processed one by one
+
 Bot-owned threads may be auto-resolved when a human explanation convincingly dismisses the concern. Human-owned threads are reply-only; the bot never resolves them.
 
 ## Data model
@@ -181,6 +187,11 @@ Findings from the previous review that are no longer present are resolved: their
 ### 1. Trigger
 
 When a human adds a note to a merge request discussion and GitLab `note_events` are enabled, the service enqueues a `discussion_reconcile` run. The note must be on a merge request (not a commit or snippet), and bot-authored notes are ignored.
+
+Enqueue rules:
+- If a `full_review` for the same MR is already queued or running, the reconcile request is ignored as `full_review_pending`.
+- Otherwise the new reconcile run is queued.
+- A newer reconcile request supersedes only queued or running reconcile runs for the same discussion thread, not for other discussions on the same MR.
 
 A reconcile run is not enqueued if a `full_review` is already queued or running for that MR — the full review will pick up the latest discussion state when it runs.
 

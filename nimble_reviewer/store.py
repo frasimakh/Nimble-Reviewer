@@ -1,12 +1,15 @@
 from __future__ import annotations
 
 import json
+import logging
 import sqlite3
 from contextlib import closing
 from datetime import UTC, datetime
 from pathlib import Path
 
 from nimble_reviewer.models import EnqueueDecision, MergeRequestState, ReviewRun, RunKind, TrackedFinding
+
+LOGGER = logging.getLogger(__name__)
 
 
 def utcnow() -> str:
@@ -54,6 +57,14 @@ class Store:
                     (project_id, mr_iid, source_sha),
                 ).fetchone()
                 if duplicate:
+                    LOGGER.info(
+                        "Ignoring duplicate full review enqueue project=%s mr=%s sha=%s existing_run_id=%s existing_status=%s",
+                        project_id,
+                        mr_iid,
+                        (source_sha or "-")[:12],
+                        duplicate["id"],
+                        duplicate["status"],
+                    )
                     self._upsert_mr_state_row(conn, project_id, mr_iid, source_sha, None, "duplicate", now)
                     conn.commit()
                     return EnqueueDecision(
@@ -64,7 +75,7 @@ class Store:
             else:
                 full_review = conn.execute(
                     """
-                    SELECT id FROM review_run
+                    SELECT id, status, source_sha FROM review_run
                     WHERE project_id = ? AND mr_iid = ? AND kind = 'full_review'
                       AND status IN ('queued', 'running')
                     ORDER BY created_at DESC, id DESC
@@ -73,6 +84,16 @@ class Store:
                     (project_id, mr_iid),
                 ).fetchone()
                 if full_review:
+                    LOGGER.info(
+                        "Ignoring discussion reconcile enqueue because full review is pending project=%s mr=%s discussion=%s note=%s blocked_by_run_id=%s blocked_by_status=%s blocked_by_sha=%s",
+                        project_id,
+                        mr_iid,
+                        trigger_discussion_id or "-",
+                        trigger_note_id or "-",
+                        full_review["id"],
+                        full_review["status"],
+                        (full_review["source_sha"] or "-")[:12],
+                    )
                     conn.commit()
                     return EnqueueDecision(
                         enqueued=False,
@@ -110,22 +131,43 @@ class Store:
             )
             run_id = int(cursor.lastrowid)
 
-            kind_filter = "" if kind == "full_review" else "AND kind = 'discussion_reconcile'"
-            conn.execute(
+            where_clauses = ["project_id = ?", "mr_iid = ?", "id <> ?", "status IN ('queued', 'running')"]
+            params: list[object] = [run_id, now, project_id, mr_iid, run_id]
+            if kind == "full_review":
+                pass
+            else:
+                where_clauses.append("kind = 'discussion_reconcile'")
+                if trigger_discussion_id:
+                    where_clauses.append("trigger_discussion_id = ?")
+                    params.append(trigger_discussion_id)
+                elif trigger_note_id is not None:
+                    where_clauses.append("trigger_note_id = ?")
+                    params.append(trigger_note_id)
+
+            superseded_count = conn.execute(
                 f"""
                 UPDATE review_run
                 SET status = 'superseded',
                     superseded_by = ?,
                     finished_at = COALESCE(finished_at, ?)
-                WHERE project_id = ? AND mr_iid = ? AND id <> ?
-                  {kind_filter}
-                  AND status IN ('queued', 'running')
+                WHERE {' AND '.join(where_clauses)}
                 """,
-                (run_id, now, project_id, mr_iid, run_id),
-            )
+                tuple(params),
+            ).rowcount
 
             self._upsert_mr_state_row(conn, project_id, mr_iid, source_sha, None, "queued", now)
             conn.commit()
+            LOGGER.info(
+                "Enqueued run project=%s mr=%s run_id=%s kind=%s sha=%s discussion=%s note=%s superseded_runs=%s",
+                project_id,
+                mr_iid,
+                run_id,
+                kind,
+                (source_sha or "-")[:12],
+                trigger_discussion_id or "-",
+                trigger_note_id or "-",
+                superseded_count,
+            )
             return EnqueueDecision(enqueued=True, reason="queued", run_id=run_id)
 
     def claim_next_run(self) -> ReviewRun | None:

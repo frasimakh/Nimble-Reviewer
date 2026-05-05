@@ -98,6 +98,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         state = attributes.get("state") or "unknown"
         project_id = (payload.get("project") or {}).get("id", "unknown")
         mr_iid = attributes.get("iid", "unknown")
+        discussion_id = attributes.get("discussion_id") or attributes.get("discussionId") or "-"
+        note_id = attributes.get("id") or "-"
 
         bot_user_id = None
         if object_kind == "note":
@@ -110,7 +112,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         if not event:
             changes = payload.get("changes") or {}
             LOGGER.info(
-                "Ignored webhook project=%s mr=%s object_kind=%s action=%s state=%s draft=%s sha=%s changes_keys=%s",
+                "Ignored webhook project=%s mr=%s object_kind=%s action=%s state=%s draft=%s sha=%s discussion=%s note=%s changes_keys=%s",
                 project_id,
                 mr_iid,
                 object_kind,
@@ -123,6 +125,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                     or attributes.get("sha")
                     or (payload.get("merge_request") or {}).get("sha")
                 ),
+                discussion_id,
+                note_id,
                 sorted(changes.keys()),
             )
             response.status_code = 202
@@ -139,7 +143,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             trigger_author_id=event.trigger_author_id,
         )
         LOGGER.info(
-            "Webhook decision status=%s reason=%s run_id=%s project=%s mr=%s kind=%s action=%s sha=%s target_sha=%s",
+            "Webhook decision status=%s reason=%s run_id=%s project=%s mr=%s kind=%s action=%s sha=%s target_sha=%s discussion=%s note=%s author=%s",
             "queued" if decision.enqueued else "ignored",
             decision.reason,
             decision.run_id,
@@ -149,6 +153,9 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             event.action,
             _short_sha(event.source_sha),
             _short_sha(event.target_sha),
+            event.trigger_discussion_id or "-",
+            event.trigger_note_id or "-",
+            event.trigger_author_id or "-",
         )
         return {
             "status": "queued" if decision.enqueued else "ignored",
