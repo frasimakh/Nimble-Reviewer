@@ -359,6 +359,75 @@ docker run -d \
 
 This publishes the service on host port `18080`, so the webhook URL is `http://<host-or-ip>:18080/webhooks/gitlab`.
 
+### Runtime state backup and restore
+
+The manual Docker setup keeps all durable state outside the image:
+
+- `.env` in the checkout, containing GitLab tokens and service settings
+- `nimble-reviewer-data`, containing SQLite state
+- `nimble-reviewer-cache`, containing repository mirrors
+- `nimble-reviewer-auth`, containing Codex CLI auth state
+- `nimble-reviewer-claude-auth`, containing Claude Code auth state
+
+Treat the backup output as a secret. It contains auth sessions and `.env`.
+
+For the usual "keep login state and `.env`" case, back up only credentials:
+
+```bash
+cd /mnt/nimble-reviewer
+scripts/backup_credentials_state.sh
+```
+
+This archives only `.env`, `nimble-reviewer-auth`, and `nimble-reviewer-claude-auth`. It intentionally skips `nimble-reviewer-cache` and `nimble-reviewer-data`, so it is much faster and small enough to copy off the VM after login changes.
+
+Restore credentials on a fresh VM:
+
+```bash
+cd /mnt/nimble-reviewer
+scripts/restore_credentials_state.sh /mnt/nimble-reviewer-credentials-backups/20260624T090000Z
+```
+
+Create a full runtime backup only when you also want SQLite state and repository mirrors:
+
+```bash
+cd /mnt/nimble-reviewer
+scripts/backup_runtime_state.sh
+```
+
+By default, the backup script briefly stops the `nimble-reviewer` container and starts it again after the volumes are archived. This avoids inconsistent SQLite/cache archives and `tar: file changed as we read it` failures.
+
+The command prints the created backup directory, for example:
+
+```text
+/mnt/nimble-reviewer-runtime-backups/20260624T090000Z
+```
+
+Restore that state on the same VM or a new VM:
+
+```bash
+cd /mnt/nimble-reviewer
+scripts/restore_runtime_state.sh /mnt/nimble-reviewer-runtime-backups/20260624T090000Z
+```
+
+The restore script creates missing Docker volumes and restores `.env`. It refuses to overwrite an existing `.env` unless you pass:
+
+```bash
+RESTORE_OVERWRITE_ENV=1 scripts/restore_runtime_state.sh /path/to/backup
+```
+
+For the manual `docker run` deployment path, this wraps the usual build, container replacement, and run command while reusing the same named volumes:
+
+```bash
+cd /mnt/nimble-reviewer
+scripts/deploy_docker_run.sh
+```
+
+Set `FOLLOW_LOGS=1` to tail the container logs after startup:
+
+```bash
+FOLLOW_LOGS=1 scripts/deploy_docker_run.sh
+```
+
 ## Authentication modes
 
 The service authenticates through both configured CLIs.

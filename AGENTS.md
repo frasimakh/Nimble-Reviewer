@@ -62,6 +62,8 @@ Supporting modules: `models.py` (frozen dataclasses), `config.py` (env vars), `t
 - Inline publish failures degrade one finding to summary-only if the MR head is still current; if the MR head changed during publish, the run is treated as stale and superseded.
 - `finding_match.py` deduplication is fuzzy; tuning thresholds affects false positives and false matches.
 - Review traces are JSONL files in `REVIEW_TRACE_DIR`; finding detail lives in GitLab discussion threads.
+- Manual Docker deployments depend on `.env` plus the named volumes `nimble-reviewer-data`, `nimble-reviewer-cache`, `nimble-reviewer-auth`, and `nimble-reviewer-claude-auth`; keep `scripts/backup_runtime_state.sh`, `scripts/restore_runtime_state.sh`, and README runtime-state guidance in sync with any deployment/auth path changes.
+- Treat `.env` and auth volumes as secrets. Do not print or inspect credential contents when debugging deployment issues; verify presence, paths, metadata, and CLI login status instead.
 
 ## Keeping Docs And Rules Current
 
