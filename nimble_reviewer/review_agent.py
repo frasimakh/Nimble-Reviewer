@@ -3,6 +3,7 @@ from __future__ import annotations
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import json
 import logging
+import re
 import subprocess
 import tempfile
 import time
@@ -16,6 +17,7 @@ from nimble_reviewer.models import (
     ReviewFinding,
     ReviewOpinion,
     ReviewParticipant,
+    ReviewProviderFailure,
     ReviewProvider,
     ReviewResult,
     ReviewTokenUsage,
@@ -213,7 +215,8 @@ class CouncilRunner:
     def review(self, prompt: str, cwd: Path, trace: RunTrace | None = None) -> ReviewResult:
         """Run the full council pipeline and return a merged ``ReviewResult``."""
         provider_runs: list[_ProviderRun] = []
-        codex_result, claude_result = self._run_parallel_reviews(prompt, cwd, trace, provider_runs)
+        provider_failures: list[ReviewProviderFailure] = []
+        codex_result, claude_result = self._run_parallel_reviews(prompt, cwd, trace, provider_runs, provider_failures)
 
         if codex_result is None and claude_result is None:
             raise ReviewAgentError("Both Codex and Claude reviews failed")
@@ -245,6 +248,7 @@ class CouncilRunner:
                 overall_risk=successful.overall_risk,
                 findings=successful.findings,
                 participants=participants,
+                provider_failures=tuple(provider_failures),
             )
 
         synthesis_prompt = build_council_synthesis_prompt(
@@ -315,6 +319,7 @@ class CouncilRunner:
             overall_risk=final_result.overall_risk,
             findings=final_result.findings,
             participants=participants,
+            provider_failures=tuple(provider_failures),
         )
 
     def _run_review_phase(
@@ -359,6 +364,7 @@ class CouncilRunner:
         cwd: Path,
         trace: RunTrace | None,
         provider_runs: list["_ProviderRun"],
+        provider_failures: list[ReviewProviderFailure],
     ) -> tuple[ReviewResult | None, ReviewResult | None]:
         results: dict[str, ReviewResult] = {}
         with ThreadPoolExecutor(max_workers=2, thread_name_prefix="council-review") as executor:
@@ -371,9 +377,17 @@ class CouncilRunner:
                 try:
                     result = future.result()
                 except Exception as exc:  # noqa: BLE001
-                    LOGGER.warning("Council %s review failed: %s", provider, exc)
+                    error = _summarize_provider_error(str(exc))
+                    provider_failures.append(
+                        ReviewProviderFailure(
+                            provider=provider,  # type: ignore[arg-type]
+                            phase="review",
+                            error=error,
+                        )
+                    )
+                    LOGGER.warning("Council %s review failed: %s", provider, error)
                     if trace:
-                        trace.write("council", "review.failed", provider=provider, error=str(exc))
+                        trace.write("council", "review.failed", provider=provider, error=error)
                     continue
                 runner_ref = self.codex_runner if provider == "codex" else self.claude_runner
                 provider_runs.append(
@@ -773,6 +787,27 @@ def _highest_severity(initial: str, *values: str) -> str:
         if ranking[value] < ranking[best]:
             best = value
     return best
+
+
+def _summarize_provider_error(error: str) -> str:
+    text = error.strip()
+    if not text:
+        return "Unknown provider failure"
+
+    auth_match = re.search(r"Failed to authenticate\. API Error:\s*([^\n\"}]+)", text)
+    if auth_match:
+        return f"Failed to authenticate. API Error: {auth_match.group(1).strip()}"
+
+    api_match = re.search(r"API Error:\s*([^\n\"}]+)", text)
+    if api_match:
+        return f"API Error: {api_match.group(1).strip()}"
+
+    status_match = re.search(r"error_status\"?\s*:\s*(\d+).*?error\"?\s*:\s*\"?([a-zA-Z0-9_-]+)", text)
+    if status_match:
+        return f"{status_match.group(2)} ({status_match.group(1)})"
+
+    first_line = next((line.strip() for line in text.splitlines() if line.strip()), text)
+    return first_line[:500]
 
 
 def _summarize_participants(

@@ -496,6 +496,10 @@ class CouncilRunnerFallbackTests(unittest.TestCase):
         self.assertEqual(len(result.findings), 1)
         self.assertEqual(len(result.participants), 1)
         self.assertEqual(result.participants[0].metadata.provider, "claude")
+        self.assertEqual(len(result.provider_failures), 1)
+        self.assertEqual(result.provider_failures[0].provider, "codex")
+        self.assertEqual(result.provider_failures[0].phase, "review")
+        self.assertEqual(result.provider_failures[0].error, "quota exceeded")
 
     def test_council_runner_falls_back_to_codex_when_claude_fails(self):
         from pathlib import Path
@@ -526,6 +530,10 @@ class CouncilRunnerFallbackTests(unittest.TestCase):
         self.assertEqual(len(result.findings), 1)
         self.assertEqual(len(result.participants), 1)
         self.assertEqual(result.participants[0].metadata.provider, "codex")
+        self.assertEqual(len(result.provider_failures), 1)
+        self.assertEqual(result.provider_failures[0].provider, "claude")
+        self.assertEqual(result.provider_failures[0].phase, "review")
+        self.assertEqual(result.provider_failures[0].error, "rate limit")
 
     def test_council_runner_raises_when_both_fail(self):
         from pathlib import Path

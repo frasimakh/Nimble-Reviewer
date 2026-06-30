@@ -75,6 +75,13 @@ class ReviewParticipant:
 
 
 @dataclass(frozen=True)
+class ReviewProviderFailure:
+    provider: ReviewProvider
+    phase: str
+    error: str
+
+
+@dataclass(frozen=True)
 class ReviewResult:
     summary: str
     overall_risk: Severity
@@ -82,6 +89,7 @@ class ReviewResult:
     token_usage: ReviewTokenUsage | None = None
     agent_metadata: ReviewAgentMetadata | None = None
     participants: tuple[ReviewParticipant, ...] = field(default_factory=tuple)
+    provider_failures: tuple[ReviewProviderFailure, ...] = field(default_factory=tuple)
 
 
 @dataclass(frozen=True)

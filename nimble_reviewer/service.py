@@ -19,6 +19,7 @@ from nimble_reviewer.models import (
     ReviewFindingState,
     ReviewOpinion,
     ReviewParticipant,
+    ReviewProviderFailure,
     ReviewResult,
     ReviewRun,
     ReviewTokenUsage,
@@ -211,6 +212,13 @@ class ReviewService:
                 self.store.mark_superseded_if_running(run.id)
                 LOGGER.info("Run %s became stale during inline publish", run.id)
                 return
+
+            if result.provider_failures and result.findings:
+                self.gitlab.create_note(
+                    run.project_id,
+                    run.mr_iid,
+                    _render_provider_failure_note(result),
+                )
 
             if not result.findings:
                 LOGGER.info(
@@ -648,7 +656,41 @@ def _incremental_review_base_sha(previous_full_review: ReviewRun | None, run: Re
 
 
 def _render_no_findings_note(result: ReviewResult) -> str:
-    return result.summary.strip() if result.summary and result.summary.strip() else "Looks good — no issues found."
+    summary = result.summary.strip() if result.summary and result.summary.strip() else "Looks good — no issues found."
+    if not result.provider_failures:
+        return summary
+    return f"{_render_provider_failure_note(result)}\n\n{summary}"
+
+
+def _render_provider_failure_note(result: ReviewResult) -> str:
+    successful = _successful_review_provider_names(result)
+    intro = (
+        f"⚠️ Review completed with {successful} only."
+        if successful
+        else "⚠️ Review completed with one or more providers unavailable."
+    )
+    lines = [
+        intro,
+        "The full Codex + Claude council did not run successfully, so this review has reduced coverage.",
+        "",
+        "Failed provider(s):",
+    ]
+    for failure in result.provider_failures:
+        lines.append(f"- {_provider_display_name(failure.provider)} {failure.phase}: {failure.error}")
+    return "\n".join(lines).strip()
+
+
+def _successful_review_provider_names(result: ReviewResult) -> str:
+    names = [
+        _provider_display_name(participant.metadata.provider)
+        for participant in result.participants
+        if "review" in participant.phases
+    ]
+    return " + ".join(dict.fromkeys(names))
+
+
+def _provider_display_name(provider: str) -> str:
+    return {"codex": "Codex", "claude": "Claude"}.get(provider, provider.capitalize())
 
 
 def _build_discussion_digest(
@@ -970,6 +1012,7 @@ def _suppress_dismissed_findings(
         token_usage=result.token_usage,
         agent_metadata=result.agent_metadata,
         participants=result.participants,
+        provider_failures=result.provider_failures,
     )
 
 
@@ -984,6 +1027,7 @@ def _enrich_result_for_rendering(result: ReviewResult, checkout_path: Path) -> R
         token_usage=result.token_usage,
         agent_metadata=result.agent_metadata,
         participants=result.participants,
+        provider_failures=result.provider_failures,
     )
 
 
@@ -1084,6 +1128,7 @@ def _review_result_snapshot_payload(result: ReviewResult) -> dict:
         "token_usage": _token_usage_snapshot_payload(result.token_usage),
         "agent_metadata": _agent_metadata_payload(result),
         "participants": _participants_payload(result),
+        "provider_failures": _provider_failures_payload(result),
     }
 
 
@@ -1153,6 +1198,19 @@ def _participants_payload(result: ReviewResult) -> list[dict] | None:
     ]
 
 
+def _provider_failures_payload(result: ReviewResult) -> list[dict] | None:
+    if not result.provider_failures:
+        return None
+    return [
+        {
+            "provider": failure.provider,
+            "phase": failure.phase,
+            "error": failure.error,
+        }
+        for failure in result.provider_failures
+    ]
+
+
 def _review_result_from_snapshot_payload(payload: dict) -> ReviewResult:
     result = _review_result_from_payload(payload, metadata=None, token_usage=None)
     token_usage_payload = payload.get("token_usage")
@@ -1167,8 +1225,9 @@ def _review_result_from_snapshot_payload(payload: dict) -> ReviewResult:
             cached_input_included_in_input=bool(token_usage_payload.get("cached_input_included_in_input", True)),
             cache_creation_included_in_input=bool(token_usage_payload.get("cache_creation_included_in_input", True)),
         )
-    participants = _participants_from_snapshot_payload(payload.get("participants"))
     metadata = _agent_metadata_from_snapshot_payload(payload.get("agent_metadata"))
+    participants = _participants_from_snapshot_payload(payload.get("participants"))
+    provider_failures = _provider_failures_from_snapshot_payload(payload.get("provider_failures"))
     return ReviewResult(
         summary=result.summary,
         overall_risk=result.overall_risk,
@@ -1176,6 +1235,7 @@ def _review_result_from_snapshot_payload(payload: dict) -> ReviewResult:
         token_usage=token_usage,
         agent_metadata=metadata,
         participants=participants,
+        provider_failures=provider_failures,
     )
 
 
@@ -1228,3 +1288,27 @@ def _participants_from_snapshot_payload(payload) -> tuple[ReviewParticipant, ...
             )
         )
     return tuple(participants)
+
+
+def _provider_failures_from_snapshot_payload(payload) -> tuple[ReviewProviderFailure, ...]:
+    if not isinstance(payload, list):
+        return ()
+    failures: list[ReviewProviderFailure] = []
+    for item in payload:
+        if not isinstance(item, dict):
+            continue
+        provider = str(item.get("provider", "")).strip().lower()
+        if provider not in {"codex", "claude"}:
+            continue
+        phase = str(item.get("phase", "")).strip() or "review"
+        error = str(item.get("error", "")).strip()
+        if not error:
+            continue
+        failures.append(
+            ReviewProviderFailure(
+                provider=provider,  # type: ignore[arg-type]
+                phase=phase,
+                error=error,
+            )
+        )
+    return tuple(failures)

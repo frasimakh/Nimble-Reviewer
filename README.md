@@ -3,6 +3,7 @@
 Containerized GitLab merge request review bot. The service accepts GitLab merge request and note webhooks, queues persisted review runs in SQLite, checks out the MR, runs Codex and Claude Code reviews in parallel, then publishes:
 
 - GitLab discussion threads for findings, inline when possible and top-level otherwise
+- top-level warning notes when one review provider fails and the result falls back to the other provider only
 - lightweight discussion reconciliation when humans reply in MR threads
 
 Full review runs are triggered when a non-draft MR is opened or reopened, when an existing MR moves from draft to ready, and when new commits are pushed to an already-open ready MR. Human comments in merge request discussions can trigger a lightweight `discussion_reconcile` run when GitLab `note_events` are enabled.
@@ -42,11 +43,13 @@ The service now has two review flows.
 
 ### Full review
 
-The full review flow always runs the council:
+The full review flow runs the council:
 
 1. Codex base review
 2. Claude base review
 3. Final synthesis into one merged review result
+
+If one base reviewer fails, the service skips synthesis, publishes the successful provider's result, and adds a top-level warning note that names the failed provider and the compact error. If both base reviewers fail, the run fails.
 
 The synthesized findings are then published as:
 
@@ -54,7 +57,7 @@ The synthesized findings are then published as:
 - top-level merge request discussions when the finding cannot be anchored safely
 - replies in relevant human threads when the concern matches an existing discussion
 
-There is no persistent note for completed reviews — findings live in their own discussion threads.
+There is no persistent note for completed successful council reviews — findings live in their own discussion threads. Degraded single-provider reviews add a warning note so developers know the review had reduced coverage.
 
 ### Discussion reconcile
 
@@ -181,6 +184,8 @@ For each finding in the council result:
 Findings that appeared in the previous review and are still present get a "still present at `<sha>`" reply added to their thread. The reply includes a hidden marker so it is never duplicated across runs.
 
 Findings from the previous review that are no longer present are resolved: their `tracked_finding` status is set to `resolved` and the GitLab discussion is marked resolved.
+
+If the council degraded to a single-provider result because Codex or Claude failed, the service also posts a top-level warning note before completing the run. When the degraded result has no findings, the warning is prepended to the clean-review note.
 
 ## Discussion reconcile — detailed flow
 

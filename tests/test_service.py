@@ -10,7 +10,16 @@ from nimble_reviewer.gitlab import (
     GitLabNote,
     GitLabUser,
 )
-from nimble_reviewer.models import MergeRequestInfo, PreparedCheckout, ReviewFinding, ReviewResult, TrackedFinding
+from nimble_reviewer.models import (
+    MergeRequestInfo,
+    PreparedCheckout,
+    ReviewAgentMetadata,
+    ReviewFinding,
+    ReviewParticipant,
+    ReviewProviderFailure,
+    ReviewResult,
+    TrackedFinding,
+)
 from nimble_reviewer.service import ReviewService, ServiceDependencies
 from nimble_reviewer.store import Store
 from nimble_reviewer.trace import TraceSettings
@@ -249,6 +258,77 @@ class ReviewServiceTests(unittest.TestCase):
         self.assertEqual(tracked[0].status, "open")
         self.assertEqual(tracked[0].thread_owner, "bot")
         self.assertIsNone(gitlab.summary_note)
+
+    def test_full_review_posts_warning_when_provider_failed(self):
+        workspace = Path(self.tmpdir.name)
+        (workspace / "file.py").write_text("new line\nsecond line\n", encoding="utf-8")
+        gitlab = FakeGitLabClient()
+        service = self._service(
+            gitlab,
+            FakeRepoManager(workspace),
+            FakeReviewAgentRunner(
+                result=ReviewResult(
+                    summary="Codex found one issue.",
+                    overall_risk="medium",
+                    findings=(ReviewFinding("medium", "file.py", 1, "Bug", "Needs fixing"),),
+                    participants=(
+                        ReviewParticipant(
+                            metadata=ReviewAgentMetadata(provider="codex", model="gpt-5.5", reasoning_effort="high"),
+                            phases=("review",),
+                        ),
+                    ),
+                    provider_failures=(
+                        ReviewProviderFailure(
+                            provider="claude",
+                            phase="review",
+                            error="Failed to authenticate. API Error: 401 Invalid authentication credentials",
+                        ),
+                    ),
+                )
+            ),
+        )
+
+        self.store.enqueue_run(1, 2, "sha1", None)
+        run = self.store.claim_next_run()
+        service.process_run(run)
+
+        self.assertIsNotNone(gitlab.summary_note)
+        self.assertIn("Review completed with Codex only.", gitlab.summary_note.body)
+        self.assertIn("Claude review: Failed to authenticate", gitlab.summary_note.body)
+
+    def test_clean_review_note_includes_warning_when_provider_failed(self):
+        workspace = Path(self.tmpdir.name)
+        (workspace / "file.py").write_text("new line\nsecond line\n", encoding="utf-8")
+        gitlab = FakeGitLabClient()
+        service = self._service(
+            gitlab,
+            FakeRepoManager(workspace),
+            FakeReviewAgentRunner(
+                result=ReviewResult(
+                    summary="Looks clear.",
+                    overall_risk="low",
+                    findings=(),
+                    participants=(
+                        ReviewParticipant(
+                            metadata=ReviewAgentMetadata(provider="codex", model="gpt-5.5", reasoning_effort="high"),
+                            phases=("review",),
+                        ),
+                    ),
+                    provider_failures=(
+                        ReviewProviderFailure(provider="claude", phase="review", error="rate limit"),
+                    ),
+                )
+            ),
+        )
+
+        self.store.enqueue_run(1, 2, "sha1", None)
+        run = self.store.claim_next_run()
+        service.process_run(run)
+
+        self.assertIsNotNone(gitlab.summary_note)
+        self.assertIn("Review completed with Codex only.", gitlab.summary_note.body)
+        self.assertIn("Claude review: rate limit", gitlab.summary_note.body)
+        self.assertIn("Looks clear.", gitlab.summary_note.body)
 
     def test_full_review_creates_plain_discussion_when_inline_publish_fails_but_head_is_stable(self):
         workspace = Path(self.tmpdir.name)

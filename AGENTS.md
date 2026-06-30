@@ -60,6 +60,7 @@ Supporting modules: `models.py` (frozen dataclasses), `config.py` (env vars), `t
 - Bot-owned threads may be resolved automatically when a human explanation dismisses the concern.
 - Findings that cannot be mapped to a valid diff position fall back to summary-only instead of failing the whole review.
 - Inline publish failures degrade one finding to summary-only if the MR head is still current; if the MR head changed during publish, the run is treated as stale and superseded.
+- If one council provider fails during base review, the run falls back to the successful provider only and publishes a top-level warning note naming the failed provider and compact error; both-provider failure still fails the run.
 - `finding_match.py` deduplication is fuzzy; tuning thresholds affects false positives and false matches.
 - Review traces are JSONL files in `REVIEW_TRACE_DIR`; finding detail lives in GitLab discussion threads.
 - Manual Docker deployments depend on `.env` plus the named volumes `nimble-reviewer-data`, `nimble-reviewer-cache`, `nimble-reviewer-auth`, and `nimble-reviewer-claude-auth`; keep `scripts/backup_runtime_state.sh`, `scripts/restore_runtime_state.sh`, and README runtime-state guidance in sync with any deployment/auth path changes.
